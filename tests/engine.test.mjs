@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS, loraAirtime, bleSegments, pathLoss, simulate, evaluate, Explorer, makeScene, normalize, objective, rankResult, compareRanks, parameterValues, normalizeSearchLimits, sensitivity, waveState, nodeState, createPropagation, antennaLoss } from '../engine.js';
+import { routeLength } from '../ilca-course.js';
 
 test('LoRa time on air matches the 24-byte firmware configuration and bandwidth scaling',()=>{
  assert.ok(Math.abs(loraAirtime(DEFAULTS)-.014144)<1e-12);
@@ -34,7 +35,7 @@ test('Small close fleet with clean TDMA delivers all reports',()=>{
  assert.equal(r.generated,20);assert.equal(r.timely,20);assert.equal(r.disconnected,0);
 });
 test('The start line runs from the pin to the actual RC receiver in every layout',()=>{
- for(const layout of ['ilcaStart','ilcaBeat','ilcaMark','spread','start','split','leader','chain']){
+ for(const layout of ['ilcaStart','ilcaBeat','ilcaMark','ilcaDownwind','ilcaLeeward','spread','start','split','leader','chain']){
   const config=normalize({boats:20,collectors:3,layout,fade:0,antennaShadow:0});
   const scene=makeScene(config),{pin,rcId}=scene.startLine,rc=scene.nodes[rcId];
   assert.equal(rcId,config.boats);
@@ -63,6 +64,55 @@ test('The default ILCA beat spreads the fleet around one course without moving t
  assert.ok(scene.nodes.some(boat=>boat.x>0&&boat.heading>.5));
  assert.ok(scene.nearest>start.nearest);
  assert.ok(rounding.farthest>scene.farthest);
+});
+test('Boats round M1, enter between both gate marks and exit around the assigned side',()=>{
+ const config=normalize({layout:'ilcaMark',speed:6});
+ const {nodes,windward,leeward}=makeScene(config);
+ const [left,right]=leeward.marks;
+ assert.equal(left.label,'3S');assert.equal(right.label,'3P');
+ assert.ok(Math.abs(right.x-left.x-42.4)<1e-9);
+ for(const boat of nodes.filter(node=>node.windwardExit>0)){
+  const speed=nodeState(config,boat,0).speed;
+  const poseAfter=waypoints=>nodeState(config,boat,routeLength({...boat,courseAhead:boat.courseAhead.slice(0,waypoints)})/speed+0.01);
+  const northOfM1=poseAfter(3);
+  const downwind=poseAfter(boat.windwardExit);
+  const trackEntry=boat.courseAhead[boat.leewardEntry-1];
+  const crossing=boat.courseAhead[boat.leewardEntry];
+  const exit=poseAfter(boat.courseAhead.length);
+  const mark=boat.gateSide<0?left:right;
+  assert.ok(northOfM1.y>windward.y);
+  assert.ok(downwind.x<windward.x && downwind.y<windward.y && Math.cos(downwind.heading)<0);
+  assert.ok(trackEntry.y>leeward.y && trackEntry.x>left.x && trackEntry.x<right.x);
+  assert.equal(crossing.y,leeward.y);
+  assert.ok(crossing.x>left.x && crossing.x<right.x);
+  assert.ok(boat.courseAhead[boat.leewardEntry+1].y<leeward.y);
+  assert.ok((exit.x-mark.x)*boat.gateSide>0 && exit.y>leeward.y && Math.cos(exit.heading)>0);
+ }
+ for(const layout of ['ilcaDownwind','ilcaLeeward']){
+  const scene=makeScene({...config,layout});
+  assert.deepEqual(scene.leeward,leeward);
+  const fleet=scene.nodes.slice(0,config.boats);
+  assert.ok(fleet.every(node=>node.y>leeward.y && node.y<windward.y && Math.cos(node.heading)<0));
+  assert.deepEqual(new Set(fleet.map(node=>node.gateSide)),new Set([-1,1]));
+ }
+});
+test('The leeward gate offset is independent of windward distance and can cross the start line',()=>{
+ const initial=makeScene(normalize({legLength:400}));
+ const longLeg=makeScene(normalize({legLength:2200}));
+ assert.equal(initial.leeward.y,93);
+ assert.deepEqual(longLeg.leeward,initial.leeward);
+ assert.notEqual(longLeg.windward.y,initial.windward.y);
+ const config=normalize({layout:'ilcaMark',leewardOffset:-100,speed:6});
+ const shifted=makeScene(config);
+ assert.deepEqual(shifted.startLine,initial.startLine);
+ assert.equal(shifted.leeward.y,-100);
+ assert.ok(shifted.leeward.marks.every(mark=>mark.y===-100));
+ const boat=shifted.nodes.find(node=>node.windwardExit>0);
+ const turn=boat.courseAhead.slice(0,boat.leewardEntry+2);
+ const speed=nodeState(config,boat,0).speed;
+ const pose=nodeState(config,boat,routeLength({...boat,courseAhead:turn})/speed+0.01);
+ assert.ok(pose.y<shifted.leeward.y);
+ assert.equal(makeScene(normalize({leewardOffset:0})).leeward.y,0);
 });
 test('The same tack affects the displayed position and the radio path loss',()=>{
  const c=normalize({layout:'ilcaBeat',speed:7,fade:0,antennaShadow:0});

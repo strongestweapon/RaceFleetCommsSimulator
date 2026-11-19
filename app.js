@@ -1,11 +1,11 @@
-import { DEFAULTS, SPACE, Explorer, MODEL_VERSION, rankResult, normalize, normalizeSearchLimits, parameterValues, isSliderParameter, nodeState, createPropagation, antennaLoss } from './engine.js';
-import { ILCA_LAYOUTS } from './ilca-course.js';
+import { DEFAULTS, SPACE, Explorer, MODEL_VERSION, rankResult, normalize, normalizeSearchLimits, parameterValues, isSliderParameter, makeScene, nodeState, createPropagation, antennaLoss } from './engine.js';
+import { ILCA_LAYOUTS, routeLength } from './ilca-course.js';
 const $ = id => document.getElementById(id);
-const labels = {ilcaStart:'ILCA · 스타트 밀집',ilcaBeat:'ILCA · 첫 업윈드',ilcaMark:'ILCA · 풍상 마크 회항',spread:'균일 격자',start:'압축 격자',split:'분리 격자',leader:'선두 독주',chain:'일렬 연결',tdma:'TDMA · 시각 동기',aloha:'ALOHA · 비동기',bow:'선수',stern:'선미',port:'좌현',starboard:'우현'};
+const labels = {ilcaStart:'ILCA · 스타트 밀집',ilcaBeat:'ILCA · 첫 업윈드',ilcaMark:'ILCA · 풍상 마크 회항',ilcaDownwind:'ILCA · 풍하 레그',ilcaLeeward:'ILCA · 풍하 게이트 회항',spread:'균일 격자',start:'압축 격자',split:'분리 격자',leader:'선두 독주',chain:'일렬 연결',tdma:'TDMA · 시각 동기',aloha:'ALOHA · 비동기',bow:'선수',stern:'선미',port:'좌현',starboard:'우현'};
 const fields = [
  ['boats','배 척수','척','common'], ['spacing','대형 폭 기준','m','common'],
  ['layout','배치','','common'], ['collectors','수집기','대','common'],
- ['legLength','첫 업윈드 길이','m','common'],
+ ['legLength','첫 업윈드 길이','m','common'], ['leewardOffset','풍하 게이트 위치','m','common'],
  ['speed','이동 속도 기준','kn','common'], ['waveHeight','파도 세기 · 유의파고 Hm0','m','common'],
  ['wavePeriod','대표 파도 주기','초','common'],
  ['hz','배당 송신 빈도','Hz','link'], ['payload','순수 데이터','B','link'],
@@ -36,6 +36,7 @@ let searchLimits = normalizeSearchLimits(saved.searchLimits);
 let explorer, current = null, replay = null, records = [], running = false, busy = false, timer = null, generation = 0;
 let kind = 'ble', selected = 0, view = 'current', evaluationMs = 0, needBaseline = false, validating = false;
 let sceneTime = 0, sceneTimer = null, sceneStart = 0, lastStart = null, actualCadence = null, cadences = [], displayedPropagation = null;
+let courseReplay = null;
 let worker = new Worker(new URL('./worker.js', import.meta.url), {type:'module'}), jobId = 0;
 const pending = new Map();
 const narrowLayout = matchMedia('(max-width: 760px)');
@@ -91,7 +92,11 @@ worker.onerror = event => { showError(event.message || '계산 엔진 오류'); 
 function request(config) { const id = ++jobId; return new Promise((resolve,reject) => {pending.set(id,{resolve,reject});worker.postMessage({id,config});}); }
 const fmt = (n, digits=0) => Number(n).toLocaleString('ko-KR',{maximumFractionDigits:digits});
 const pct = n => `${(n*100).toFixed(1)}%`;
-function valueLabel(key,value,unit='') { return key === 'cr' ? `4/${value}` : `${labels[value] || fmt(value,3)}${unit ? ' '+unit : ''}`; }
+function valueLabel(key,value,unit='') {
+ if(key==='cr')return `4/${value}`;
+ if(key==='leewardOffset')return value===0?'0m':`${value>0?'풍상':'풍하'} ${fmt(Math.abs(value),3)}m`;
+ return `${labels[value] || fmt(value,3)}${unit ? ' '+unit : ''}`;
+}
 const layoutOptions = SPACE.layout.map(layout => new Option(labels[layout], layout));
 $('map-layout').replaceChildren(...layoutOptions);
 $('map-layout').onchange = () => setLayout($('map-layout').value);
@@ -215,10 +220,11 @@ function syncFields(config){
  $('mounting-range').textContent=`경기정 안테나 수면 기준 ${range}m`;
  const ilca=ILCA_LAYOUTS.includes(config.layout);
  $('p-legLength').disabled=!ilca;
+ $('p-leewardOffset').disabled=!ilca;
  $('p-spacing').setAttribute('aria-label',ilca?'대형 폭 기준':'배 간격 척도');
 }
 function resolveStrategy(strategy, version) {
- if (strategy==='hybrid' && version!==MODEL_VERSION) return 'random';
+ if (strategy==='hybrid' && !['0.7.0','0.8.0','0.8.1',MODEL_VERSION].includes(version)) return 'random';
  return ['hybrid','sequential','local','random'].includes(strategy)?strategy:'random';
 }
 function persist(){ try{localStorage.setItem('sailing-radio-lab-v1',JSON.stringify({modelVersion:MODEL_VERSION,base,keys:[...keys],searchLimits,target,strategy:$('strategy').value}));}catch{} }
@@ -236,9 +242,10 @@ function updateButtons(){
  $('run-state').textContent=validating?'다른 시드 검증 중':busy?'조건 평가 중':explorer?.done?completedLabel():running?'자동 탐색 중':'일시정지';
  $('run-state').dataset.active=String(running || busy);
  $('open-trial').disabled=!displayResult();
+ $('course-playback').disabled=busy && !courseReplay;
 }
 function resetSearch(){
- stop();stopScene();sceneTime=0;lastStart=null;actualCadence=null;cadences=[];generation++;records=[];current=null;replay=null;view='current';$('case-view').value='current';
+ stop();clearSceneReplay();lastStart=null;actualCadence=null;cadences=[];generation++;records=[];current=null;replay=null;view='current';$('case-view').value='current';syncCourseMode(null);
  target=$('objective').value;explorer=new Explorer(base,[...keys],target,$('search-mode').value,$('strategy').value,searchLimits);
  base=explorer.base;needBaseline=true;
  $('validation-result').textContent='탐색 중에는 같은 시드로 비교합니다.';
@@ -292,15 +299,75 @@ function rankSummary(rank, includeMissing=true) {
  return `${coverage}공백 ${rank.gap.toFixed(2)}초 · 도착 ${pct(rank.pdr)} · P95 ${delay}`;
 }
 function stopScene(){clearInterval(sceneTimer);sceneTimer=null;$('scene-play').textContent='장면 재생';$('scene-play').setAttribute('aria-pressed','false');}
+function clearSceneReplay(){
+ stopScene();
+ courseReplay=null;
+ sceneTime=0;
+}
+function syncCourseMode(result){
+ const active=Boolean(courseReplay);
+ $('panel-map').dataset.scene=active?'course':'radio';
+ $('course-playback').hidden=!result?.scene.windward;
+ $('course-playback').textContent=active?'통신 화면':'코스 재생';
+ $('course-case').hidden=!active;
+ if(active)$('course-case').textContent=courseReplay.config.layout==='ilcaLeeward'?'G3 풍하 게이트 회항':'M1 풍상 → G3 풍하 게이트';
+ $('course-legend').hidden=!active;
+ $('radio-legend').hidden=active;
+ $('scene-time').setAttribute('aria-label',active?'코스 재생 시간':'평가 구간 안의 장면 시간');
+}
+function coursePose(node){
+ const time=Math.min(sceneTime,courseReplay.finishTimes[node.id] ?? sceneTime);
+ return nodeState(courseReplay.config,node,time);
+}
+function startScene(){
+ const result=displayResult();
+ if(!result)return;
+ const rate=courseReplay?courseReplay.duration/16:1;
+ if(sceneTime>=(courseReplay?.duration ?? result.config.duration))sceneTime=0;
+ sceneStart=performance.now()-sceneTime*1000/rate;
+ $('scene-play').textContent='장면 정지';$('scene-play').setAttribute('aria-pressed','true');
+ sceneTimer=setInterval(()=>{
+  const activeResult=displayResult();
+  if(!activeResult){stopScene();return;}
+  const end=courseReplay?.duration ?? activeResult.config.duration;
+  sceneTime=Math.min(end,Math.floor((performance.now()-sceneStart)*rate/100)/10);
+  drawSea();showBoat();
+  if(sceneTime>=end)stopScene();
+ },courseReplay?40:100);
+}
+$('course-playback').onclick=()=>{
+ const result=displayResult();
+ if(courseReplay){
+  clearSceneReplay();
+ }else{
+  if(!result?.scene.windward || busy)return;
+  stop();stopScene();sceneTime=0;
+  const layout=result.config.layout==='ilcaLeeward'?'ilcaLeeward':'ilcaMark';
+  const config={...result.config,layout,speed:result.config.speed || 5};
+  const scene=result.config.layout===layout?result.scene:makeScene(config);
+  const fleet=scene.nodes.slice(0,config.boats);
+  if(layout==='ilcaMark' && !fleet[selected].windwardExit){
+   const approaching=fleet.find(boat=>boat.windwardExit>0);
+   if(approaching){selected=approaching.id;$('boat-select').value=selected;}
+  }
+  const finishTimes=fleet.map(boat=>routeLength(boat)/nodeState(config,boat,0).speed);
+  const duration=Math.ceil(Math.max(...finishTimes)*10)/10;
+  const waypoints=fleet.flatMap(boat=>boat.courseAhead);
+  const branches=[fleet.find(boat=>boat.gateSide<0),fleet.find(boat=>boat.gateSide>0)];
+  courseReplay={result,config,scene,finishTimes,duration,waypoints,branches};
+ }
+ syncCourseMode(result);drawSea();showBoat();updateButtons();
+ if(courseReplay)startScene();
+};
 $('scene-time').oninput=()=>{stopScene();sceneTime=Number($('scene-time').value);drawSea();showBoat();};
 $('scene-play').onclick=()=>{
- if(sceneTimer){stopScene();return;}const result=displayResult();if(!result)return;
- if(sceneTime>=result.config.duration)sceneTime=0;sceneStart=performance.now()-sceneTime*1000;
- $('scene-play').textContent='장면 정지';$('scene-play').setAttribute('aria-pressed','true');
- sceneTimer=setInterval(()=>{const r=displayResult();if(!r){stopScene();return;}sceneTime=Math.min(r.config.duration,Math.floor((performance.now()-sceneStart)/100)/10);drawSea();showBoat();if(sceneTime>=r.config.duration)stopScene();},100);
+ if(sceneTimer)stopScene();
+ else startScene();
 };
 function render(){
  const result=displayResult();if(!result)return;
+ if(courseReplay && courseReplay.result!==result)clearSceneReplay();
+ syncCourseMode(result);
  const c=result.config,s=result[kind];syncFields(c);
  $('iteration').textContent=fmt(explorer.iteration);
  $('metric-pdr').textContent=s.capped?'평가 제외':pct(s.pdr);
@@ -326,7 +393,7 @@ function render(){
   $('candidate-description').textContent=proposal?`${trialHeading}\n${changes.length>2?`${changes.length}개 항목 변경`:changes.join(' / ')||'변경 없음'}\n${trialStatus}`:configSummary(c);
  }
  $('trial-full').textContent=proposal?`${trialHeading}\n\n${changes.join('\n')||'변경 없음'}\n${rankSummary(result.rank)}${reference}\n${trialStatus}\n\n${configSummary(c)}`:configSummary(c);
- const environmentKeys=['boats','spacing','legLength','layout','collectors','speed','waveHeight','wavePeriod','boatHeight','loss'].filter(k=>keys.has(k));
+ const environmentKeys=['boats','spacing','legLength','leewardOffset','layout','collectors','speed','waveHeight','wavePeriod','boatHeight','loss'].filter(k=>keys.has(k));
  $('search-guidance').textContent=$('search-mode').value==='repeat'?'설정은 고정하고 시드만 바꿔 결과의 흔들림을 봅니다.':environmentKeys.length?`환경 변수 ${environmentKeys.length}개도 변경 중 · 통신 설정만의 개선과 구분해 해석하세요.`:'배치·이동·파도·시드를 고정하고 선택한 통신 설정을 비교합니다.';
  $('cadence-status').textContent=`계산 ${fmt(evaluationMs)}ms${actualCadence!==null?` · 평균 간격 ${(actualCadence/1000).toFixed(2)}초`:''}`;
  $('environment-caption').textContent=`${labels[c.layout]}${result.scene.windward?' · 가상 대형':''} / 파고 ${c.waveHeight}m · 기준 속도 ${c.speed}kn · 모의 ${c.duration}초`;
@@ -341,7 +408,19 @@ function render(){
  drawSea();drawHistory();updateButtons();
 }
 function showBoat(){
- const result=displayResult();if(!result)return;const b=result[kind].byBoat[selected];
+ const result=displayResult();if(!result)return;
+ if(courseReplay){
+  const boat=coursePose(courseReplay.scene.nodes[selected]);
+  const mark=boat.gateSide<0?'3S 왼쪽':'3P 오른쪽';
+  const stage=sceneTime>=courseReplay.finishTimes[selected]?`${mark} 회항 완료`
+   :boat.waypointsPassed>boat.leewardEntry?`${mark} 회항`
+   :boat.waypointsPassed===boat.leewardEntry?'G3 게이트 진입'
+   :boat.waypointsPassed>=boat.windwardExit?(courseReplay.config.layout==='ilcaLeeward'?'G3 접근':'풍하 레그'):'M1 풍상 마크 회항';
+  const detail=`${stage} · ${fmt(boat.speed/.514444,1)}kn`;
+  $('boat-detail').textContent=detail;$('boat-detail').title=detail;
+  return;
+ }
+ const b=result[kind].byBoat[selected];
  if(displayedPropagation?.result!==result||displayedPropagation?.kind!==kind)displayedPropagation={result,kind,channel:createPropagation(result.config,result.scene,kind)};
  const channel=displayedPropagation.channel;channel.advance(sceneTime);
  const config=result.config, rcId=result.scene.startLine.rcId;
@@ -357,74 +436,135 @@ function showBoat(){
 function canvasContext(canvas){const dpr=Math.min(window.devicePixelRatio||1,2),w=canvas.clientWidth,h=canvas.clientHeight; if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);} const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);return {ctx,w,h};}
 function color(name){return getComputedStyle(document.documentElement).getPropertyValue(name).trim();}
 let hitPoints=[];
+function courseClock(seconds){
+ const whole=Math.floor(seconds);
+ return `${Math.floor(whole/60)}:${String(whole%60).padStart(2,'0')}`;
+}
 function drawSea(){
  const result=displayResult();if(!result)return;const {ctx,w,h}=canvasContext($('sea'));if(w<90||h<75)return;
- const c=result.config,stats=result[kind];sceneTime=Math.min(sceneTime,c.duration);
- $('scene-time').max=c.duration;$('scene-time').value=sceneTime;$('scene-clock').textContent=`${sceneTime.toFixed(1)} / ${c.duration.toFixed(1)}초`;
- const {startLine:{pin,rcId},windward}=result.scene;
- const nodes=result.scene.nodes.map(n=>nodeState(c,n,sceneTime));
+ const c=courseReplay?.config ?? result.config,scene=courseReplay?.scene ?? result.scene,stats=result[kind];
+ const end=courseReplay?.duration ?? c.duration;
+ sceneTime=Math.min(sceneTime,end);
+ $('scene-time').max=end;$('scene-time').value=sceneTime;
+ $('scene-clock').textContent=courseReplay?`${courseClock(sceneTime)} / ${courseClock(end)}`:`${sceneTime.toFixed(1)} / ${end.toFixed(1)}초`;
+ const {startLine:{pin,rcId},windward,leeward}=scene;
+ const nodes=scene.nodes.map(node=>courseReplay?coursePose(node):nodeState(c,node,sceneTime));
  const rc=nodes[rcId];
- const bounds=[pin,...result.scene.nodes,...result.scene.nodes.map(n=>nodeState(c,n,c.duration))];
  const nearStart=c.layout==='ilcaStart';
- const showWindward=windward&&!nearStart;
+ const nearGate=c.layout==='ilcaLeeward';
+ const fitNodes=nearGate?scene.nodes.slice(0,c.boats+1):scene.nodes;
+ const bounds=[pin,...fitNodes,...(courseReplay?.waypoints ?? fitNodes.map(node=>nodeState(c,node,end)))];
+ const showWindward=windward&&!nearStart&&!nearGate;
+ const showGate=leeward&&!nearStart;
  if(showWindward)bounds.push(windward);
+ if(showGate)bounds.push(...leeward.marks);
+ const chosenBoat=scene.nodes[selected];
+ const hasRunRoute=chosenBoat.leewardEntry!==undefined;
+ if(hasRunRoute && !courseReplay)bounds.push(...chosenBoat.courseAhead);
  const xvals=bounds.map(p=>p.x),yvals=bounds.map(p=>p.y);
  const minX=Math.min(...xvals),maxX=Math.max(...xvals),minY=Math.min(...yvals),maxY=Math.max(...yvals);
- const sx=Math.max(c.spacing*3,maxX-minX),sy=Math.max(c.spacing*3,maxY-minY),scale=Math.min((w-54)/sx,(h-68)/sy);
+ const minimumSpan=nearGate?140:c.spacing*3;
+ const sx=Math.max(minimumSpan,maxX-minX),sy=Math.max(minimumSpan,maxY-minY),scale=Math.min((w-54)/sx,(h-68)/sy);
  const mx=(minX+maxX)/2,my=(minY+maxY)/2,verticalCenter=h/2+(nearStart?10:-13);
  const X=x=>w/2+(x-mx)*scale,Y=y=>verticalCenter-(y-my)*scale;
  const rcX = X(rc.x), rcY = Y(rc.y);
  const extent = Math.max(...bounds.map(p=>Math.hypot(p.x-rc.x,p.y-rc.y)));
  drawReceiverRanges(ctx,rcX,rcY,scale,extent,w,h);
- if(showWindward){
+ if(showWindward && !courseReplay){
   ctx.strokeStyle=color('--map-guide');ctx.globalAlpha=.55;ctx.lineWidth=1;ctx.setLineDash([3,5]);
-  ctx.beginPath();ctx.moveTo(X(windward.x),Y(0));ctx.lineTo(X(windward.x),Y(windward.y));ctx.stroke();
+  ctx.beginPath();ctx.moveTo(X(leeward.x),Y(leeward.y));ctx.lineTo(X(windward.x),Y(windward.y));ctx.stroke();
   ctx.setLineDash([]);ctx.globalAlpha=1;
  }
- const successfulPaths=new Map();
- if($('show-links').checked)for(const b of stats.byBoat){for(let i=1;i<b.path.length;i++){const a=b.path[i-1],z=b.path[i];successfulPaths.set(`${a}-${z}`,[a,z]);}}
- ctx.strokeStyle=color('--blue');ctx.lineWidth=.8;ctx.globalAlpha=.18;
- for(const [from,to] of successfulPaths.values()){
-  drawPacketHop(ctx,X(nodes[from].x),Y(nodes[from].y),X(nodes[to].x),Y(nodes[to].y),3);
- }
- ctx.globalAlpha=1;
- const chosen=stats.byBoat[selected];
- if($('show-links').checked && chosen.path.length){
+ if(!courseReplay && $('show-links').checked){
+  const successfulPaths=new Map();
+  for(const b of stats.byBoat){for(let i=1;i<b.path.length;i++){const a=b.path[i-1],z=b.path[i];successfulPaths.set(`${a}-${z}`,[a,z]);}}
+  ctx.strokeStyle=color('--blue');ctx.lineWidth=.8;ctx.globalAlpha=.18;
+  for(const [from,to] of successfulPaths.values()){
+   drawPacketHop(ctx,X(nodes[from].x),Y(nodes[from].y),X(nodes[to].x),Y(nodes[to].y),3);
+  }
+  ctx.globalAlpha=1;
+  const chosen=stats.byBoat[selected];
   ctx.strokeStyle=color('--blue');ctx.lineWidth=2;
   for(let i=1;i<chosen.path.length;i++){
    const from=nodes[chosen.path[i-1]],to=nodes[chosen.path[i]];
    drawPacketHop(ctx,X(from.x),Y(from.y),X(to.x),Y(to.y),8);
   }
  }
- drawStartLine(ctx,X(pin.x),rcX,rcY,rc.x-pin.x,nearStart);
- if(showWindward){
-  const x=X(windward.x),y=Y(windward.y);
-  ctx.strokeStyle=color('--pin');ctx.lineWidth=1.5;ctx.strokeRect(x-3.5,y-3.5,7,7);
-  ctx.fillStyle=color('--text');ctx.font='600 11px system-ui';ctx.textAlign='left';ctx.fillText('M1 풍상 마크',x+10,y+4);
+ if(hasRunRoute){
+  if(courseReplay){
+   const alternateBranch=courseReplay.branches[chosenBoat.gateSide<0?1:0];
+   drawSailingRoute(ctx,alternateBranch,X,Y,gateColor(alternateBranch.gateSide),alternateBranch.leewardEntry);
+  }
+  drawSailingRoute(ctx,chosenBoat,X,Y,courseReplay?gateColor(chosenBoat.gateSide):'--blue');
  }
+ drawStartLine(ctx,X(pin.x),rcX,rcY,rc.x-pin.x,nearStart);
+ if(showWindward)drawCourseMark(ctx,X(windward.x),Y(windward.y),'M1 풍상 마크');
  hitPoints=[];ctx.font='11px system-ui';
  for(const node of nodes){
   const x=X(node.x),y=Y(node.y);hitPoints.push({id:node.id,x,y});
   if(node.id===rcId)continue;
   if(node.collector){ctx.fillStyle=color('--blue');ctx.fillRect(x-5,y-5,10,10);ctx.fillStyle=color('--text');ctx.textAlign='left';ctx.fillText(node.label,x+10,y+4);continue;}
-  const b=stats.byBoat[node.id],p=b.timely/b.sent,fill=color(p>=.9?'--best':p>0?'--partial':'--worst');
-  if(c.speed>0&&sceneTime>0){
-   const initial=result.scene.nodes[node.id];
+  const b=stats.byBoat[node.id],p=b.timely/b.sent;
+  const fill=color(courseReplay?gateColor(node.gateSide):p>=.9?'--best':p>0?'--partial':'--worst');
+  if(!courseReplay && c.speed>0 && sceneTime>0){
+   const initial=scene.nodes[node.id];
    ctx.strokeStyle=fill;ctx.globalAlpha=.55;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(X(initial.x),Y(initial.y));
    for(let i=0;i<node.waypointsPassed;i++)ctx.lineTo(X(initial.courseAhead[i].x),Y(initial.courseAhead[i].y));
    ctx.lineTo(x,y);ctx.stroke();ctx.globalAlpha=1;
   }
-  if(kind==='ble' && node.relay){ctx.strokeStyle=fill;ctx.globalAlpha=.65;ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,8,0,Math.PI*2);ctx.stroke();ctx.globalAlpha=1;}
+  if(!courseReplay && kind==='ble' && node.relay){ctx.strokeStyle=fill;ctx.globalAlpha=.65;ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,8,0,Math.PI*2);ctx.stroke();ctx.globalAlpha=1;}
   ctx.save();ctx.translate(x,y);ctx.rotate(node.heading);ctx.scale(Math.max(.35,Math.cos(node.roll)),1);ctx.fillStyle=fill;ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(3.7,4);ctx.lineTo(0,2.5);ctx.lineTo(-3.7,4);ctx.closePath();ctx.fill();ctx.restore();
   if(node.id===selected){ctx.strokeStyle=color('--text');ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,11,0,Math.PI*2);ctx.stroke();ctx.textAlign='left';ctx.fillStyle=color('--text');ctx.fillText(`배 ${node.id+1}`,x+14,y-8);}
   else if(c.boats<=30){ctx.fillStyle=color('--muted');ctx.textAlign='left';ctx.fillText(String(node.id+1),x+8,y+4);}
  }
+ if(showGate)drawLeewardGate(ctx,leeward,X,Y,rcY);
  const raw=75/scale,mag=10**Math.floor(Math.log10(raw)),bar=Math.max(mag,Math.floor(raw/mag)*mag),pixels=bar*scale;
  const scaleRight=w-12,scaleLeft=scaleRight-pixels,scaleY=h-10;
  ctx.strokeStyle=color('--muted');ctx.lineWidth=1;ctx.beginPath();
  ctx.moveTo(scaleLeft,scaleY-4);ctx.lineTo(scaleLeft,scaleY);ctx.lineTo(scaleRight,scaleY);ctx.lineTo(scaleRight,scaleY-4);ctx.stroke();
  ctx.fillStyle=color('--muted');ctx.textAlign='center';ctx.fillText(`${fmt(bar)} m`,(scaleLeft+scaleRight)/2,scaleY-8);
- $('sea').setAttribute('aria-label',`${labels[c.layout]}, ${kind==='ble'?'BLE Mesh':'LoRa'} ${c.boats}척. 기한 내 도착률 ${pct(stats.pdr)}, 기한 내 미갱신 ${stats.missingTimely}척. 스타트 라인 왼쪽은 핀마크, 오른쪽은 수신 전용 RC 보트.${showWindward?' 위쪽은 풍상 마크 M1.':''}`);
+ const mapDescription=courseReplay?`${$('course-case').textContent} 코스 재생. 경기정 ${c.boats}척.`
+  :`${labels[c.layout]}, ${kind==='ble'?'BLE Mesh':'LoRa'} ${c.boats}척. 기한 내 도착률 ${pct(stats.pdr)}, 기한 내 미갱신 ${stats.missingTimely}척.`;
+ const marksDescription=showGate?` G3 풍하 게이트는 스타트 라인 기준 ${valueLabel('leewardOffset',leeward.y)}. 왼쪽 3S와 오른쪽 3P 사이로 진입합니다.`:'';
+ $('sea').setAttribute('aria-label',`${mapDescription} 스타트 라인 왼쪽은 핀마크, 오른쪽은 수신 전용 RC 보트.${showWindward?' 풍상 마크 M1.':''}${marksDescription}`);
+}
+function gateColor(side){return side<0?'--blue':'--partial';}
+function drawCourseMark(ctx,x,y,label,labelY=y+4,align='left'){
+ ctx.save();
+ ctx.fillStyle=color('--water');ctx.fillRect(x-3.5,y-3.5,7,7);
+ ctx.strokeStyle=color('--pin');ctx.lineWidth=1.5;ctx.strokeRect(x-3.5,y-3.5,7,7);
+ ctx.fillStyle=color('--text');ctx.font='600 11px system-ui';ctx.textAlign=align;
+ const labelX=x+(align==='right'?-8:8);
+ ctx.strokeStyle=color('--water');ctx.lineJoin='round';ctx.lineWidth=3;ctx.strokeText(label,labelX,labelY);
+ ctx.fillText(label,labelX,labelY);
+ ctx.restore();
+}
+function drawLeewardGate(ctx,gate,X,Y,rcY){
+ const y=Y(gate.y),[left,right]=gate.marks;
+ const labelY=Math.abs(y-rcY)<23?Math.min(y,rcY)-8:y+4;
+ ctx.save();
+ ctx.strokeStyle=color('--pin');ctx.lineWidth=1;ctx.setLineDash([2,3]);
+ ctx.beginPath();ctx.moveTo(X(left.x),y);ctx.lineTo(X(right.x),y);ctx.stroke();
+ ctx.setLineDash([]);
+ drawCourseMark(ctx,X(left.x),y,left.label,labelY,'right');
+ drawCourseMark(ctx,X(right.x),y,right.label,labelY);
+ ctx.restore();
+}
+function drawSailingRoute(ctx,boat,X,Y,tone,first=0){
+ const waypoints=boat.courseAhead.slice(first);
+ const origin=first?boat.courseAhead[first-1]:boat;
+ ctx.save();
+ ctx.strokeStyle=color(tone);ctx.globalAlpha=.78;ctx.lineWidth=1.5;ctx.setLineDash([4,4]);
+ ctx.beginPath();ctx.moveTo(X(origin.x),Y(origin.y));
+ for(const waypoint of waypoints)ctx.lineTo(X(waypoint.x),Y(waypoint.y));
+ ctx.stroke();ctx.setLineDash([]);
+ let from=origin;
+ for(const to of waypoints){
+  const x=X(from.x), y=Y(from.y),dx=X(to.x)-x,dy=Y(to.y)-y;
+  if(Math.hypot(dx,dy)>32)drawPacketHop(ctx,x+dx*.33,y+dy*.33,x+dx*.67,y+dy*.67,3);
+  from=to;
+ }
+ ctx.restore();
 }
 function drawReceiverRanges(ctx, x, y, scale, extent, width, height) {
  const wanted = Math.max(extent/4, 46/scale);
@@ -588,7 +728,7 @@ $('import').onclick=()=>$('import-file').click();
 $('import-file').onchange=async()=>{
  const file=$('import-file').files[0];if(!file)return;
  try{if(file.size>5e6)throw new Error('5MB 이하 기록을 선택해 주세요.');const data=JSON.parse(await file.text());
- if(!['0.1.0','0.2.0','0.3.0','0.4.0','0.5.0','0.6.0',MODEL_VERSION].includes(data.modelVersion) || !data.current && !data.base)throw new Error('지원하는 모델 버전의 탐색 기록이 아닙니다.');
+ if(!['0.1.0','0.2.0','0.3.0','0.4.0','0.5.0','0.6.0','0.7.0','0.8.0','0.8.1',MODEL_VERSION].includes(data.modelVersion) || !data.current && !data.base)throw new Error('지원하는 모델 버전의 탐색 기록이 아닙니다.');
  base=normalize({antennaShadow:0,boatHeight:1.2,boatHeightSpread:0,...(data.current||data.base)});keys=new Set((data.keys||defaultKeys).filter(k=>Object.hasOwn(SPACE,k)));searchLimits=normalizeSearchLimits(data.searchLimits);target=['both','lora','ble'].includes(data.target)?data.target:'both';$('objective').value=target;
  $('strategy').value=['hybrid','sequential','local','random'].includes(data.strategy)?data.strategy:'random';$('search-mode').value=['both','best','worst','repeat'].includes(data.mode)?data.mode:'both';
  if([100,200,500,1000,2000,5000].includes(data.paceMs))$('pace').value=data.paceMs;

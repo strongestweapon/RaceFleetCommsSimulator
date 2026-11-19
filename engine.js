@@ -1,11 +1,11 @@
-import { ILCA_LAYOUTS, ilcaCourse, ilcaBoats } from './ilca-course.js';
+import { ILCA_LAYOUTS, ILCA_LEEWARD_OFFSET, ilcaCourse, ilcaBoats } from './ilca-course.js';
 
 // Screening model, not a calibrated RF or Bluetooth conformance simulator.
 // All time values are seconds, positions metres, power dBm unless noted.
-export const MODEL_VERSION = '0.7.0';
+export const MODEL_VERSION = '0.9.0';
 export const ENVIRONMENT_STEP = 0.1;
 export const DEFAULTS = Object.freeze({
-  boats: 100, spacing: 70, layout: 'ilcaBeat', legLength: 1100, collectors: 1,
+  boats: 100, spacing: 70, layout: 'ilcaBeat', legLength: 1100, leewardOffset: ILCA_LEEWARD_OFFSET, collectors: 1,
   speed: 0, waveHeight: 0, wavePeriod: 4,
   hz: 1, payload: 24, duration: 8, deadline: 1, seed: 20261119,
   power: 8, boatHeight: 0.8, boatHeightSpread: 0.2, receiverHeight: 3, fade: 3, loss: 3,
@@ -17,6 +17,7 @@ export const DEFAULTS = Object.freeze({
 });
 export const SPACE = Object.freeze({
   boats: [10, 200, 10], spacing: [10, 250, 10], legLength: [400, 2200, 100],
+  leewardOffset: [-300, 200, 1],
   speed: [0, 15, 1], waveHeight: [0, 3, 0.25], wavePeriod: [2, 8, 1],
   layout: [...ILCA_LAYOUTS, 'spread', 'start', 'split', 'leader', 'chain'],
   collectors: [1, 3, 1], power: [0, 20, 2],
@@ -32,7 +33,7 @@ export const SPACE = Object.freeze({
   relays: [0, 60, 5], ttl: [0, 2, 3, 4, 5], repeats: [1, 2, 3],
   scan: [25, 50, 75, 100]
 });
-const RANGED = new Set(['boats', 'spacing', 'legLength', 'collectors', 'power', 'boatHeight', 'loss', 'relays', 'speed', 'waveHeight', 'wavePeriod',
+const RANGED = new Set(['boats', 'spacing', 'legLength', 'leewardOffset', 'collectors', 'power', 'boatHeight', 'loss', 'relays', 'speed', 'waveHeight', 'wavePeriod',
   'boatHeightSpread', 'receiverHeight', 'antennaShadow', 'fade', 'bleSensitivity', 'channelSpacing', 'adjacent', 'capture', 'queueMs']);
 export const isSliderParameter = key => RANGED.has(key);
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
@@ -114,7 +115,8 @@ export function makeScene(c) {
   if (c.collectors >= 2) nodes.push({ id: n + 1, x: -offset, y: maxY * 0.55, collector: true, relay: false, label: 'G2' });
   if (c.collectors >= 3) nodes.push({ id: n + 2, x: offset, y: maxY * 0.95, collector: true, relay: false, label: 'G3' });
   const near = nodes.slice(0, n).map((p, i) => Math.min(...nodes.slice(0, n).filter((_, j) => i !== j).map(q => Math.hypot(p.x - q.x, p.y - q.y))));
-  return { nodes, startLine, windward: course?.windward ?? null, nearest: near.reduce((a, b) => a + b, 0) / n, farthest: Math.max(...nodes.slice(0, n).map(p => Math.min(...nodes.slice(n).map(q => Math.hypot(p.x - q.x, p.y - q.y))))) };
+  return { nodes, startLine, windward: course?.windward ?? null, leeward: course?.leeward ?? null,
+    nearest: near.reduce((a, b) => a + b, 0) / n, farthest: Math.max(...nodes.slice(0, n).map(p => Math.min(...nodes.slice(n).map(q => Math.hypot(p.x - q.x, p.y - q.y))))) };
 }
 
 function legacyBoats(c, side, r) {

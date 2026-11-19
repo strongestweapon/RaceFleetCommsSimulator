@@ -1,9 +1,17 @@
-export const ILCA_LAYOUTS = Object.freeze(['ilcaStart', 'ilcaBeat', 'ilcaMark']);
+export const ILCA_LAYOUTS = Object.freeze(['ilcaStart', 'ilcaBeat', 'ilcaMark', 'ilcaDownwind', 'ilcaLeeward']);
+export const ILCA_LEEWARD_OFFSET = Math.round(0.05 * 1852);
+const HULL_LENGTH = 4.24;
 
-// ILCA Race Management Policies, January 2025, §7.2. The leg length is an input.
+// ILCA Race Management Policies (January 2025), §§6.5–6.6 and 7.2.
 export function ilcaCourse(config) {
-  return { halfLine: config.boats * 4.24 * 1.5 / 2,
-    windward: { x: 0, y: config.legLength, label: 'M1' } };
+  const y = config.leewardOffset ?? ILCA_LEEWARD_OFFSET;
+  const halfGate = HULL_LENGTH * 10 / 2;
+  return { halfLine: config.boats * HULL_LENGTH * 1.5 / 2,
+    windward: { x: 0, y: config.legLength, label: 'M1' },
+    leeward: { x: 0, y, marks: [
+      { x: -halfGate, y, label: '3S' },
+      { x: halfGate, y, label: '3P' }
+    ] } };
 }
 
 // Sample race-shaped fleets inspired by the UK Nationals replays. Values below
@@ -12,9 +20,11 @@ export function ilcaBoats(config, course, uniform, normal) {
   const boats = [];
   for (let id = 0; id < config.boats; id++) {
     let bestPoint, bestClearance = -1;
+    // Keep both branches represented even in small fleets and lopsided samples.
+    const gateSide = id === 0 ? -1 : id === 1 ? 1 : undefined;
     // Prefer a little initial clearance and cap attempts in crowded setups.
     for (let attempt = 0; attempt < 80; attempt++) {
-      const point = sampleBoat(config, course, uniform, normal);
+      const point = sampleBoat(config, course, uniform, normal, gateSide);
       let clearance = Infinity;
       for (const boat of boats) clearance = Math.min(clearance, Math.hypot(boat.x - point.x, boat.y - point.y));
       if (clearance > bestClearance) { bestPoint = point; bestClearance = clearance; }
@@ -25,7 +35,7 @@ export function ilcaBoats(config, course, uniform, normal) {
   return boats;
 }
 
-function sampleBoat(c, { halfLine, windward }, random, noise) {
+function sampleBoat(c, { halfLine, windward, leeward }, random, noise, gateSide) {
   const L = windward.y;
   const spread = c.spacing * 4.6;
   if (c.layout === 'ilcaStart') {
@@ -54,18 +64,70 @@ function sampleBoat(c, { halfLine, windward }, random, noise) {
     return { x, y, heading, courseAhead: [tack, next] };
   }
 
-  // Some boats are already past M1. The pack and its tail approach from the right.
+  const runLength = L - leeward.y;
+  const lane = (random() < 0.58 ? -1 : 1) * spread * (0.24 + random() * 0.32);
+  gateSide = gateSide ?? Math.sign(lane);
+  const run = [
+    { x: lane, y: leeward.y + runLength * 0.68 },
+    { x: lane * 0.60, y: leeward.y + runLength * 0.23 }
+  ];
+  const leeY = leeward.y;
+  const mark = leeward.marks[gateSide < 0 ? 0 : 1];
+  const entryX = mark.x * (0.22 + 0.42 * random());
+  const turnRadius = 8 + 10 * random();
+  const turn = [
+    { x: entryX, y: leeY + 16 },
+    { x: entryX, y: leeY },
+    { x: mark.x, y: leeY - turnRadius },
+    { x: mark.x + gateSide * turnRadius, y: leeY - 4 },
+    { x: mark.x + gateSide * (32 + 50 * random()), y: leeY + 42 + 50 * random() }
+  ];
+
+  if (c.layout === 'ilcaDownwind') {
+    const progress = Math.max(0.12, Math.min(0.88, 0.52 + noise() * 0.20));
+    const y = L - runLength * progress;
+    const x = lane * (0.55 + Math.sin(Math.PI * progress) * 0.45) + noise() * 13;
+    return routedBoat(x, y, [], run.filter(point => point.y < y - 8), turn, gateSide);
+  }
+
+  if (c.layout === 'ilcaLeeward') {
+    const inbound = 18 + random() ** 1.5 * Math.min(runLength * 0.34, 95 + spread * 0.18);
+    const x = entryX + gateSide * inbound * 0.36 + noise() * 8;
+    return routedBoat(x, leeY + inbound, [], [], turn, gateSide);
+  }
+
+  // Some boats have already rounded M1. The rest approach from the right.
   const radius = 12;
   if (random() < 0.25) {
-    const exitDistance = 16 + random() ** 1.5 * (50 + spread * 0.35);
-    return { x: -radius - exitDistance * 0.55 + noise() * 8,
-      y: L + radius - exitDistance + noise() * 7, heading: -2.76 + noise() * 0.13 };
+    const exitDistance = 16 + random() ** 1.5 * Math.min(runLength * 0.25, 50 + spread * 0.35);
+    const x = -radius - exitDistance * 0.55 + noise() * 8;
+    const y = L + radius - exitDistance + noise() * 7;
+    return routedBoat(x, y, [], run.filter(point => point.y < y - 8), turn, gateSide);
   }
-  const inbound = 10 + random() ** 1.85 * (90 + spread * 0.47);
+  const inbound = 10 + random() ** 1.85 * Math.min(runLength * 0.4, 90 + spread * 0.47);
   const x = radius + inbound * 0.81 + noise() * (9 + inbound * 0.14);
   const y = L - inbound + noise() * 7;
-  const entry = { x: radius, y: L - 4 };
-  const courseAhead = [entry, { x: radius, y: L + 8 }, { x: 0, y: L + radius },
+  const approach = [{ x: radius, y: L - 4 }, { x: radius, y: L + 8 }, { x: 0, y: L + radius },
     { x: -radius, y: L + 7 }, { x: -radius - 23, y: L - 54 }];
-  return { x, y, heading: Math.atan2(entry.x - x, entry.y - y), courseAhead };
+  return routedBoat(x, y, approach, run, turn, gateSide);
+}
+
+function routedBoat(x, y, approach, run, turn, gateSide) {
+  const courseAhead = [...approach, ...run, ...turn];
+  const first = courseAhead[0];
+  return {
+    x, y, heading: Math.atan2(first.x - x, first.y - y), courseAhead, gateSide,
+    windwardExit: approach.length,
+    leewardEntry: approach.length + run.length + 1
+  };
+}
+
+export function routeLength(boat) {
+  let length = 0;
+  let previous = boat;
+  for (const point of boat.courseAhead) {
+    length += Math.hypot(point.x - previous.x, point.y - previous.y);
+    previous = point;
+  }
+  return length;
 }
