@@ -1,0 +1,77 @@
+{
+  "modelVersion": "0.7.0",
+  "reviewed": "2026-11-19",
+  "purpose": "Protocol and geometry screening; empirical sea-trial calibration is still required.",
+  "sources": [
+    {
+      "title": "Semtech SX1261/2 datasheet Rev 2.2, December 2024",
+      "url": "https://www.semtech.com/products/wireless-rf/lora-connect/sx1262",
+      "usedFor": "LoRa sensitivity table and packet-time parameters; CW rejection values are NOT treated as LoRa-on-LoRa measured rejection."
+    },
+    {
+      "title": "Silicon Labs Bluetooth Mesh Node Principles and Optimization",
+      "url": "https://docs.silabs.com/btmesh/latest/btmesh-network-optimization/02-bluetooth-mesh-node-principles-and-optimization",
+      "usedFor": "Managed flooding, relay selection, duplicate caches, segmentation."
+    },
+    {
+      "title": "Silicon Labs Bluetooth Mesh Networking Principles",
+      "url": "https://docs.silabs.com/btmesh/latest/btmesh-network-optimization/03-bluetooth-mesh-networking-principles",
+      "usedFor": "TTL, network and relay transmission behavior."
+    },
+    {
+      "title": "Bluetooth SIG Mesh Networking Primer",
+      "url": "https://www.bluetooth.com/bluetooth-mesh-networking-primer/",
+      "usedFor": "Distinction between advertising-bearer Mesh and connected BLE."
+    },
+    {
+      "title": "nRF52840 Product Specification v1.8",
+      "url": "https://devzone.nordicsemi.com/cfs-file/__key/communityserver-discussions-components-files/4/nRF52840_5F00_PS_5F00_v1.8.pdf",
+      "usedFor": "Illustrative -95 dBm short-packet 1M sensitivity; exposed as an editable model input."
+    },
+    {
+      "title": "NIST Engineering Statistics Handbook: One variable at a time",
+      "url": "https://www.itl.nist.gov/div898/handbook/pri/section2/pri212.htm",
+      "usedFor": "OFAT exposes individual effects but misses parameter interactions; reason for following diagnosis with joint local/random search."
+    },
+    {
+      "title": "NOAA NDBC: Nondirectional and Directional Wave Data Analysis Procedures",
+      "url": "https://www.ndbc.noaa.gov/wavemeas.pdf",
+      "usedFor": "Spectral significant wave height Hm0 = 4 sqrt(m0). Does not validate our illustrative spectrum, vessel roll or RF fading coefficients."
+    },
+    {
+      "title": "ILCA Race Management Policies, January 2025",
+      "url": "https://www.laserinternational.org/wp-content/uploads/2024/12/ILCA-RM-Policies-2025.pdf",
+      "usedFor": "Fleet starting line length guideline in §7.2."
+    },
+    {
+      "title": "ILCA UK Open & National Championships 2026",
+      "url": "https://www.tractrac.com/event-page/event_20260723_ILCAUKOpen/3476",
+      "usedFor": "Qualitative fleet shapes observed in ILCA 7 R1 and R14. Raw positions were not used."
+    },
+    {
+      "title": "Texas Instruments AN058 Antenna Selection Guide",
+      "url": "https://www.ti.com/lit/an/swra161b/swra161b.pdf",
+      "usedFor": "Azimuth patterns and short/dipole axis effects. Does not validate installed ILCA antenna patterns or body shadow magnitude."
+    }
+  ],
+  "assumptionsNotMeasurements": [
+    "Two-ray far-field/free-space loss envelope",
+    "6 dB capture threshold",
+    "45 dB non-overlapping adjacent-channel suppression",
+    "10 ms BLE scanning cycle and modeled queue timing",
+    "Sufficient independent LoRa receivers per channel at every collector",
+    "Pre-provisioned fleet, reliable off-air collector backhaul",
+    "No sea-reflection phase, real antenna pattern, GNSS interference, energy or regulatory model",
+    "No Vakaros protocol emulation or claim about its operational performance",
+    "Seeded motion along the initial heading or scripted ILCA route, per-boat speed 0.7–1.3 times input; fixed collector positions",
+    "Illustrative three-component deep-water wave field, roll RMS 12 degrees/m with +/-70 degree clip and collector roll halved; not ILCA hydrodynamics",
+    "Time-varying wave fading scale 3 dB/m and scalar polarization loss; 0.1 s propagation snapshots, in-flight packets rechecked at each snapshot",
+    "Per-link static shadowing held fixed within each evaluation; zero waves and zero speed retain stationary propagation",
+    "One-factor-at-a-time diagnosis followed by local search with 22% random restarts; no global optimum guarantee",
+    "ILCA default windward leg 1,100 m, synthetic distributions and scripted heading changes. The positions are shared by the map and both radios.",
+    "Near-horizontal short-dipole coupling from each hull heading and heel, with a numerical floor for ideal nulls. Not an antenna-specific measured pattern.",
+    "Heading-relative shadow per racing boat: peak 4 dB aft by default, adjustable 0–20 dB and bow, stern, port or starboard.",
+    "Default boat mount heights sampled uniformly from 0.60 to 1.00 m above the water using the seed. The nominal 0.80 m and ±0.20 m spread are editable."
+  ],
+  "validation": "node --test tests/*.test.mjs; checks software invariants, not prediction accuracy"
+}
