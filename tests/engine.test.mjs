@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEFAULTS, loraAirtime, bleSegments, pathLoss, simulate, evaluate, Explorer, makeScene, normalize, objective, rankResult, compareRanks, parameterValues, normalizeSearchLimits, sensitivity, waveState, nodeState, createPropagation, antennaLoss } from '../engine.js';
+import { DEFAULTS, loraAirtime, bleSegments, pathLoss, simulate, evaluate, createFastEvaluator, Explorer, makeScene, normalize, objective, rankResult, compareRanks, parameterValues, normalizeSearchLimits, sensitivity, waveState, nodeState, createPropagation, antennaLoss } from '../engine.js';
 import { routeLength } from '../ilca-course.js';
 
 test('LoRa time on air matches the 24-byte firmware configuration and bandwidth scaling',()=>{
@@ -30,9 +30,106 @@ test('Same config and seed reproduce packet results and relay layout',()=>{
  const scene=makeScene(normalize({...c,relays:25}));
  assert.equal(scene.nodes.filter(p=>p.relay).length,5);
 });
+test('Single-radio evaluation preserves the report and rank of the full evaluation',()=>{
+ const config={...DEFAULTS,boats:20,duration:1,waveHeight:.5};
+ const full=evaluate(config);
+ for(const target of ['lora','ble']){
+  const result=evaluate(config,target);
+  assert.deepEqual(result,{config:full.config,scene:full.scene,[target]:full[target]});
+  assert.deepEqual(rankResult(result,target),rankResult(full,target));
+ }
+});
+test('Fast evaluation reuses only the radio whose inputs are unchanged',()=>{
+ const evaluateFast=createFastEvaluator('both');
+ const base=normalize({boats:30,layout:'ilcaStart',waveHeight:1,speed:5});
+ const configs=[base,{...base,channels:4,mac:'aloha'},{...base,relays:40,repeats:3},{...base,seed:base.seed+1},
+  {...base,channels:3,jitter:1},{...base,channels:4,duration:2},{...base,channels:3,waveHeight:2}];
+ const reports=configs.map(config=>{
+  const fast=evaluateFast(config), full=evaluate(config,'both',true);
+  assert.deepEqual(rankResult(fast),rankResult(full));
+  for(const radio of ['lora','ble']) {
+   assert.deepEqual(fast[radio].fleet,full[radio].fleet);
+   assert.deepEqual(fast[radio].diagnostics,full[radio].diagnostics);
+  }
+  return fast;
+ });
+ assert.strictEqual(reports[0].ble,reports[1].ble);
+ assert.notStrictEqual(reports[0].lora,reports[1].lora);
+ assert.strictEqual(reports[0].lora,reports[2].lora);
+ assert.notStrictEqual(reports[0].ble,reports[2].ble);
+ assert.notStrictEqual(reports[0].lora,reports[3].lora);
+ assert.notStrictEqual(reports[0].ble,reports[3].ble);
+});
+test('Fast diagnostics distinguish missed slots, cutoff, collisions and weak links',()=>{
+ const base={...DEFAULTS,boats:10,layout:'spread',spacing:10,fade:0,jitter:0};
+ const cases=[
+  [{reportTiming:'grouped',channels:4}, {unsent:6}],
+  [{mac:'aloha',bw:250,channels:4,seed:6}, {overtime:1}],
+  [{mac:'aloha',reportTiming:'synchronized',channels:1}, {collision:10}],
+  [{power:-5,loss:15,spacing:200}, {weak:7}],
+  [{hz:.5,mac:'aloha',seed:1}, {unplanned:5,overtime:1}]
+ ];
+ for(const [overrides,expected] of cases){
+  const config={...base,...overrides};
+  const {diagnostics,...report}=evaluate(config,'lora',true).lora;
+  assert.deepEqual(report,evaluate(config,'lora').lora);
+  assert.deepEqual(Object.fromEntries(Object.entries(diagnostics.counts).filter(([,count])=>count)),expected);
+  assert.equal(Object.values(diagnostics.counts).reduce((a,b)=>a+b),report.fleet.target-report.fleet.rounds[0].received);
+  if(expected.overtime){
+   assert.ok(diagnostics.example.transmittedAt<1);
+   assert.ok(diagnostics.example.endsAt>1);
+  }
+ }
+ assert.equal(evaluate(base,'lora',true).lora.diagnostics,undefined);
+ assert.equal(evaluate({...base,maxEvents:2},'lora',true).lora.diagnostics,undefined);
+});
 test('Small close fleet with clean TDMA delivers all reports',()=>{
  const r=simulate({...DEFAULTS,boats:10,spacing:10,fade:0,loss:0,jitter:0,duration:2,channels:1});
  assert.equal(r.generated,20);assert.equal(r.timely,20);assert.equal(r.disconnected,0);
+});
+test('Simultaneous requests can pass with slots but collide when transmitted together',()=>{
+ const c={boats:20,layout:'spread',spacing:10,duration:2,hz:1,channels:2,fade:0,jitter:0,reportTiming:'synchronized'};
+ const scheduled=simulate(c,'lora'), simultaneous=simulate({...c,mac:'aloha'},'lora');
+ assert.equal(scheduled.fleet.complete,2);
+ assert.deepEqual(scheduled.fleet.rounds,[{second:0,sent:20,received:20},{second:1,sent:20,received:20}]);
+ assert.equal(simultaneous.transmitted,40);
+ assert.equal(simultaneous.failures.unsent,0);
+ assert.equal(simultaneous.failures.interference,40);
+ assert.equal(simultaneous.fleet.complete,0);
+ const grouped=simulate({...c,reportTiming:'grouped'},'lora');
+ assert.deepEqual([...new Set(grouped.byBoat.map(b=>b.firstScheduled))],[0,.25,.5,.75]);
+});
+test('A carried-over packet cannot satisfy the previous round even when individually timely',()=>{
+ const r=simulate({...DEFAULTS,duration:8,reportTiming:'grouped'},'lora');
+ assert.equal(r.delivered,r.generated);
+ assert.ok(r.timely>0);
+ assert.equal(r.fleet.complete,0);
+ assert.ok(r.fleet.rounds.every(round=>round.received<r.fleet.target));
+});
+test('One-second trials cut off later transmissions and count the configured fleet',()=>{
+ const grouped=simulate({...DEFAULTS,duration:1,reportTiming:'grouped'},'lora');
+ assert.equal(grouped.generated,100);
+ assert.equal(grouped.transmitted,98);
+ assert.equal(grouped.delivered,98);
+ assert.equal(grouped.failures.unsent,2);
+ assert.deepEqual(grouped.fleet.rounds,[{second:0,sent:98,received:98}]);
+ const slow=simulate({...DEFAULTS,duration:1,hz:.5},'lora');
+ assert.ok(slow.generated<100);
+ assert.equal(slow.fleet.target,100);
+ assert.equal(slow.fleet.complete,0);
+});
+test('Queue drops are distinct from transmitted packets missing at the receiver',()=>{
+ const r=simulate({boats:100,layout:'ilcaBeat',duration:2,hz:5,sf:12,bw:125,queueMs:20},'lora');
+ assert.equal(r.generated,1000);
+ assert.equal(r.transmitted,200);
+ assert.equal(r.failures.unsent,800);
+ assert.equal(r.failures.interference,200);
+ const delayed=simulate({boats:10,spacing:20,layout:'spread',duration:2,hz:.5,jitter:10,queueMs:20,seed:5},'lora');
+ assert.equal(delayed.unsentBoats,1);
+ assert.equal(delayed.transmitted,9);
+ assert.equal(delayed.delivered,9);
+ assert.equal(delayed.missingTimely,1);
+ assert.equal(delayed.byBoat.find(boat=>boat.transmitted===0).scheduled,1);
 });
 test('The start line runs from the pin to the actual RC receiver in every layout',()=>{
  for(const layout of ['ilcaStart','ilcaBeat','ilcaMark','ilcaDownwind','ilcaLeeward','spread','start','split','leader','chain']){
@@ -179,26 +276,28 @@ test('Every generated report is timely or in exactly one failure bucket',()=>{
  for(const kind of ['lora','ble']){
   const r=simulate({...DEFAULTS,boats:50,duration:2,hz:5,channels:1},kind);
   assert.equal(r.timely+Object.values(r.failures).reduce((a,b)=>a+b,0),r.generated);
+  assert.equal(r.transmitted+r.failures.unsent,r.generated);
+  assert.ok(r.transmitted>=r.delivered);
   assert.ok(r.delivered>=r.timely);assert.ok(r.pdr>=0 && r.pdr<=1);
   assert.ok(r.longestGap<=2);
  }
 });
-test('A calculation cap is visible and cannot become an apparent worst case',()=>{
+test('A calculation cap is visible and cannot become a best case',()=>{
  const r=evaluate({...DEFAULTS,maxEvents:2,duration:2});
  assert.equal(r.lora.capped,true);assert.equal(objective(r),null);
  const explorer=new Explorer(DEFAULTS,['sf']);explorer.accept(r);
- assert.equal(explorer.best,null);assert.equal(explorer.worst,null);
+ assert.equal(explorer.best,null);
 });
-test('Search holds unchecked conditions fixed and incumbent extrema are monotonic',()=>{
- const base={...DEFAULTS,boats:20,duration:2},ex=new Explorer(base,['sf','channels','relays'],'both');
- let best=null,worst=null;
+test('Search holds unchecked conditions fixed and the best passing case improves monotonically',()=>{
+ const base={...DEFAULTS,boats:20,duration:2},ex=new Explorer(base,['sf','channels','relays'],'lora');
+ let best=null;
  for(let i=0;i<12;i++){
   const candidate=ex.candidate();
   for(const k of ['boats','spacing','hz','power','seed','ttl'])assert.equal(candidate.config[k],base[k]);
   ex.accept(evaluate(candidate.config));
   if(best)assert.ok(compareRanks(ex.best.rank,best)<=0);
-  if(worst)assert.ok(compareRanks(ex.worst.rank,worst)>=0);
-  best=ex.best.rank;worst=ex.worst.rank;
+  best=ex.best?.rank;
+  if(best)assert.equal(best.feasible,true);
  }
 });
 test('Fixed-condition seed sampling works with no enabled search variables',()=>{
@@ -211,25 +310,28 @@ test('A capped unused protocol does not invalidate a single-protocol objective',
  assert.equal(objective(r,'lora'),.9);assert.equal(objective(r,'ble'),null);assert.equal(objective(r,'both'),null);
 });
 
-test('Fleet coverage wins before silence, timely delivery and P95, in that order',()=>{
+test('Failing any one-second round blocks a candidate even with excellent aggregate metrics',()=>{
  const ex=new Explorer(DEFAULTS,['sf'],'lora','best','local');ex.r=()=>.9;
+ const failedFleet={target:100,complete:1,rounds:[{received:100},{received:99}]};
  const runs=[
-  [.99,{missingTimely:1,longestTimelyGap:2}],
+  [.99,{fleet:failedFleet,longestTimelyGap:.02}],
   [.80,{missingTimely:0,longestTimelyGap:1}],
-  [.95,{missingTimely:0,longestTimelyGap:1.1}],
+  [.95,{fleet:failedFleet,longestTimelyGap:.01}],
   [.85,{missingTimely:0,longestTimelyGap:1,latency95:.8}],
   [.85,{missingTimely:0,longestTimelyGap:1,latency95:.02}],
  ];
  const outcomes=runs.map(([pdr,metrics])=>ex.accept(scored(ex.candidate().config,pdr,metrics)).decision);
- assert.deepEqual(outcomes,['baseline','accepted','retained','accepted','accepted']);
+ assert.deepEqual(outcomes,['out','accepted','out','accepted','accepted']);
  assert.equal(ex.best.iteration,5);
- assert.equal(ex.worst.iteration,1);
+ assert.equal(ex.iteration,5);
+ assert.equal(ex.passed,3);
 });
 
 test('Selecting both radios uses the less favourable value of each ranking metric',()=>{
  const {lora,ble}=scored(DEFAULTS,.9,{missingTimely:1,longestTimelyGap:2,latency95:.4});
- Object.assign(ble,{pdr:.8,missingTimely:0,longestTimelyGap:3,latency95:.1});
- assert.deepEqual(rankResult({lora,ble}),{missing:1,gap:3,pdr:.8,latency95:.4});
+ Object.assign(ble,{pdr:.8,missingTimely:0,longestTimelyGap:3,latency95:.1,fleet:{target:100,complete:0,rounds:[{received:99}]}});
+ assert.deepEqual(rankResult({lora,ble}),{feasible:false,fleetComplete:0,fleetFloor:.99,missing:1,gap:3,pdr:.8,latency95:.4});
+ assert.equal(rankResult({lora,ble},'lora').feasible,true);
  assert.equal(rankResult({lora,ble:{...ble,capped:true}}),null);
 });
 
@@ -334,7 +436,8 @@ test('Moving wave scenarios reproduce both protocols and retain packet accountin
 });
 
 function scored(config,score,metrics={}) {
- const report={pdr:score,capped:false,missingTimely:0,longestTimelyGap:2,latency95:.2,...metrics};
+ const report={pdr:score,capped:false,missingTimely:0,longestTimelyGap:2,latency95:.2,
+   fleet:{target:100,complete:1,rounds:[{received:100}]},...metrics};
  return {config:normalize(config),lora:{...report},ble:{...report}};
 }
 test('Ordered diagnosis resets all other parameters to baseline and stops after one pass',()=>{
@@ -344,17 +447,15 @@ test('Ordered diagnosis resets all other parameters to baseline and stops after 
  for(const c of configs)assert.equal(c.seed,DEFAULTS.seed);
  assert.equal(ex.candidate(),null);
 });
-test('Rejected local trials keep the incumbent, in both optimization directions',()=>{
- for(const goal of ['best','worst']){
-  const ex=new Explorer(DEFAULTS,['sf'],'lora',goal,'local');ex.r=()=>.9;
+test('Rejected local trials keep the best passing condition as their starting point',()=>{
+  const ex=new Explorer(DEFAULTS,['sf'],'lora','best','local');ex.r=()=>.9;
   ex.accept(scored(ex.candidate().config,.5));
-  const improved=ex.candidate(),goodScore=goal==='best'?.8:.2;
+  const improved=ex.candidate(),goodScore=.8;
   assert.equal(ex.accept(scored(improved.config,goodScore)).decision,'accepted');
   const rejected=ex.candidate();assert.equal(rejected.parentIteration,2);
   assert.equal(ex.accept(scored(rejected.config,.5)).decision,'retained');
   const next=ex.candidate();assert.equal(next.parentIteration,2);assert.equal(next.parentScore,goodScore);
-  assert.equal(next.changes[0].from,improved.config.sf);assert.equal(ex[goal].config.sf,improved.config.sf);
- }
+  assert.equal(next.changes[0].from,improved.config.sf);assert.equal(ex.best.config.sf,improved.config.sf);
 });
 test('Hybrid search transitions from diagnosis into joint search while holding environment fixed',()=>{
  const c=normalize({speed:5,waveHeight:1,wavePeriod:5}),ex=new Explorer(c,['channels'],'both','both','hybrid');

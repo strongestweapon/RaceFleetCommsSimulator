@@ -18,13 +18,22 @@
 <main class="console">
   <section class="toolbar" aria-label="시뮬레이션 실행">
     <div class="actions">
-      <button id="run" class="primary" disabled>탐색 시작</button>
-      <button id="step" disabled>1회 평가</button>
-      <button id="reset">새 탐색</button>
+      <button id="run" class="primary" disabled>탐색</button>
+      <label class="inline-label pace-label" title="탐색의 화면 갱신 간격"><span>화면 간격</span><select id="pace" aria-label="탐색 화면 간격"><option value="100">0.1초</option><option value="200">0.2초</option><option value="500">0.5초</option><option value="1000" selected>1초</option><option value="2000">2초</option><option value="5000">5초</option></select></label>
+      <button id="fast-run" type="button" title="지도 없이 최대 속도로 탐색" disabled>고속 탐색</button>
     </div>
-    <label class="inline-label pace-label"><span>평가 간격</span><select id="pace"><option value="100">0.1초</option><option value="200">0.2초</option><option value="500">0.5초</option><option value="1000" selected>1초</option><option value="2000">2초</option><option value="5000">5초</option></select></label>
     <output id="cadence-status" class="cadence">계산 대기</output>
     <button id="open-notes" class="notes-button" aria-label="모델 가정과 출처">모델 가정</button>
+  </section>
+
+  <section id="fast-panel" class="fast-panel" aria-labelledby="fast-title" hidden>
+    <h2 id="fast-title">고속 탐색</h2>
+    <p id="fast-target" class="muted"></p>
+    <dl class="fast-counts">
+      <div><dt>평가 횟수</dt><dd id="fast-iterations">0</dd></div>
+      <div><dt>성공 횟수</dt><dd id="fast-successes">0</dd></div>
+      <div><dt>새 스냅샷</dt><dd id="fast-saved">0</dd></div>
+    </dl>
   </section>
 
   <div class="workspace">
@@ -42,40 +51,48 @@
     <section id="panel-map" class="experiment" aria-label="경기장 지도">
       <div class="map-toolbar">
         <div class="segmented" aria-label="지도에서 볼 통신 방식"><button id="view-ble" aria-pressed="true">BLE Mesh</button><button id="view-lora" aria-pressed="false">LoRa</button></div>
-        <label class="inline-label map-select"><span class="sr-only">화면</span><select id="case-view"><option value="current">현재 평가</option><option value="best">발견한 최선</option><option value="worst">발견한 최악</option></select></label>
+        <label class="inline-label map-select"><span class="sr-only">화면</span><select id="case-view"><option value="current">현재 평가</option><option value="best" disabled>발견한 최선</option></select></label>
         <label class="check"><input id="show-links" type="checkbox" checked><span>전달 경로</span></label>
       </div>
 
-      <div class="metrics" aria-label="현재 성과">
-        <div><span>1초 내 도착률</span><strong id="metric-pdr">—</strong><small id="metric-delivered">—</small></div>
-        <div><span>1초 내 미갱신 경기정</span><strong id="metric-isolated">—</strong><small id="metric-gap">—</small></div>
+      <div class="metrics" aria-label="표시된 회차의 전체 평가 결과">
+        <div><span id="metric-fleet-label">이번 1초 수신</span><strong id="metric-fleet">—</strong><small id="metric-packet-flow">—</small><small id="metric-search-total">성공 횟수 0회</small></div>
+        <div><span id="coverage-label">RC 수신 · 1초 기준</span>
+          <div class="coverage-counts">
+            <div class="received"><span>수신</span><strong id="metric-received">—</strong></div>
+            <div class="missed"><span>송신 후 0건</span><strong id="metric-isolated">—</strong></div>
+            <div class="unsent"><span>미송신</span><strong id="metric-unsent">—</strong></div>
+          </div>
+          <small id="metric-gap">—</small>
+        </div>
         <div><span>도착 지연 P95</span><strong id="metric-latency">—</strong><small id="metric-hops">—</small></div>
       </div>
 
       <div class="sea-wrap">
         <div class="map-label">
-          <div class="map-scenario"><label><span class="sr-only">지도 코스 배치</span><select id="map-layout"></select></label><span id="map-case">기준 조건</span></div>
+          <div class="map-scenario"><label><span class="sr-only">지도 코스 배치</span><select id="map-layout"></select></label><span id="map-case">기준 조건</span><strong id="case-verdict" hidden></strong></div>
           <span id="course-case" hidden></span>
           <span id="map-distance">—</span>
         </div>
         <canvas id="sea" aria-label="경기장과 경기정 위치">경기장 지도</canvas>
-        <div class="map-legend" id="radio-legend"><span><i class="dot success"></i>90% 이상</span><span><i class="dot partial"></i>일부 도착</span><span><i class="dot failed"></i>미도착</span><span>○ 중계</span><span id="route-key">경기정 → 수집기</span></div>
+        <div class="map-legend" id="radio-legend"><span><i class="dot success"></i>수신 90% 이상</span><span><i class="dot partial"></i>일부 수신</span><span><i class="dot failed"></i>송신 후 0건</span><span><i class="dot unsent"></i>송신 없음</span><span>○ 중계</span><span id="route-key">경기정 → 수집기</span></div>
+        <div class="map-legend" id="excluded-legend" hidden>이벤트 한도 초과 · 수신 평가 제외</div>
         <div class="map-legend" id="course-legend" hidden><span><i class="line gate-left"></i>3S 왼쪽 회항</span><span><i class="line gate-right"></i>3P 오른쪽 회항</span><span>통신 평가는 결과 탭</span></div>
       </div>
 
       <div class="scene-timeline">
         <button id="scene-play" aria-pressed="false">장면 재생</button>
         <button id="course-playback" type="button" hidden>코스 재생</button>
-        <input id="scene-time" type="range" min="0" max="8" step="0.1" value="0" aria-label="평가 구간 안의 장면 시간">
-        <output id="scene-clock">0.0 / 8.0초</output>
+        <input id="scene-time" type="range" min="0" max="1" step="0.1" value="0" aria-label="평가 구간 안의 장면 시간">
+        <output id="scene-clock">지도 0.0 / 1.0초</output>
       </div>
-      <div class="selected-row"><label><span class="sr-only">경기정 선택</span><select id="boat-select" aria-label="자세히 볼 경기정"></select></label><output id="boat-detail">—</output></div>
+      <div class="selected-row"><label><span class="sr-only">경기정 선택</span><select id="boat-select" aria-label="자세히 볼 경기정"></select></label><strong id="boat-reception" hidden></strong><output id="boat-detail">—</output></div>
     </section>
 
     <aside class="dock" aria-label="결과와 설정">
       <section class="panel result-panel" id="panel-result" role="tabpanel" aria-labelledby="tab-result">
-        <div class="panel-section"><h2>통신 방식별 도착률</h2><div id="compare-results"></div></div>
-        <div class="panel-section"><h2>미도착 원인 <small>모델 추정</small></h2><div id="failure-bars"></div></div>
+        <div class="panel-section"><h2>통신 방식 비교 <small>1초 판정 · 패킷 도착률</small></h2><div id="compare-results"></div></div>
+        <div class="panel-section"><h2>기한 내 미도착 원인 <small>모델 추정</small></h2><div id="failure-bars"></div></div>
         <div class="panel-section trial-summary">
           <div class="section-heading"><h2>평가 조건</h2><button id="open-trial" class="text-button" disabled>변경 상세 ↗</button></div>
           <p id="candidate-description">기준 조건을 평가하고 있습니다.</p>
@@ -84,20 +101,22 @@
         <div class="panel-section history-overview">
           <div class="section-heading"><h2>탐색 이력</h2><button id="open-history" class="text-button" type="button" aria-controls="panel-history">상세 이력 →</button></div>
           <canvas id="history-overview" class="history-canvas" aria-label="평가별 도착률. 지점을 누르면 해당 평가를 지도에서 다시 봅니다.">탐색 이력 그래프</canvas>
-          <div class="history-legend"><span><i class="dot current"></i>평가 도착률</span><span><i class="line best"></i>최선 후보</span><span><i class="line worst"></i>최악 후보</span></div>
+          <div class="history-legend"><span><i class="dot current"></i>통과</span><span><i class="dot failed"></i>조건 미달</span><span><i class="line best"></i>통과 중 최선</span></div>
         </div>
       </section>
 
       <section class="panel history-panel" id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden>
         <div class="panel-section chart">
           <h2>탐색 이력</h2><p id="search-status" class="muted">평가 대기</p>
-          <canvas id="history" class="history-canvas" aria-label="평가 횟수에 따른 현재, 최선 및 최악의 도착률">탐색 이력 그래프</canvas>
-          <div class="history-legend"><span><i class="dot current"></i>평가 도착률</span><span><i class="line best"></i>최선 후보 도착률</span><span><i class="line worst"></i>최악 후보 도착률</span></div>
+          <canvas id="history" class="history-canvas" aria-label="회차별 패킷 도착률과 전원 수신 조건 통과 여부">탐색 이력 그래프</canvas>
+          <div class="history-legend"><span><i class="dot current"></i>통과</span><span><i class="dot failed"></i>조건 미달</span><span><i class="line best"></i>통과 중 최선</span></div>
           <p class="muted">그래프를 누르면 해당 조건을 지도에 표시합니다.</p>
         </div>
         <div class="case-cards">
           <button class="case-card" id="best-card"><span>발견한 최선</span><strong id="best-score">—</strong><small id="best-config">기준 평가 대기</small></button>
-          <button class="case-card" id="worst-card"><span>발견한 최악</span><strong id="worst-score">—</strong><small id="worst-config">기준 평가 대기</small></button>
+          <button type="button" id="open-snapshots">스냅샷</button>
+          <p id="last-fast-status" class="muted" hidden></p>
+          <button type="button" id="open-fast-report" hidden>고속 탐색 실패 분석</button>
         </div>
         <div class="validation"><button id="validate" disabled>선택한 조건 · 다른 시드 5회 검증</button><output id="validation-result">탐색 중에는 같은 시드로 비교합니다.</output></div>
       </section>
@@ -122,14 +141,14 @@
         <h2>자동 탐색 설정</h2>
         <div class="search-fields">
           <label>탐색 방법<select id="strategy"><option value="random">설정 범위 안에서 무작위</option><option value="hybrid">순차 비교 → 조합 탐색</option><option value="sequential">한 항목씩 순서대로</option><option value="local">좋은 해 유지 · 주변 탐색</option></select></label>
-          <label>탐색 방향<select id="search-mode"><option value="both">최선 · 최악 교대</option><option value="best">최선 탐색</option><option value="worst">최악 탐색</option><option value="repeat">고정 조건 · 시드 반복</option></select></label>
+          <label>탐색 모드<select id="search-mode"><option value="best">통과 조건 중 최선</option><option value="repeat">고정 조건 · 시드 반복</option></select></label>
           <label>평가 대상<select id="objective"><option value="both">BLE와 LoRa 모두</option><option value="ble">BLE Mesh</option><option value="lora">LoRa</option></select></label>
           <div class="field-grid">
             <label>난수 시드<input id="seed" type="number" min="0" max="4294967295" value="20261119"></label>
-            <div id="search-controls"></div>
+            <p class="muted">시험 구간 0–1초</p>
           </div>
         </div>
-        <p class="muted">순위는 미갱신 척수 → 최장 갱신 공백 → 1초 내 도착률 → P95 지연 순으로 정합니다. 두 방식 모두 평가하면 각 지표의 불리한 쪽을 적용합니다.</p>
+        <p class="muted">매 1초 전원 수신이 통과 기준입니다. 통과 조건은 갱신 공백, 패킷 도착률, P95 지연으로 비교합니다.</p>
         <p id="search-guidance" class="muted">환경을 고정하고 통신 설정을 비교합니다.</p>
         <div class="tools"><button id="export">기록 저장</button><button id="import">조건 불러오기</button><input id="import-file" type="file" accept="application/json,.json" hidden></div>
       </section>
@@ -155,7 +174,7 @@
 <dialog id="model-notes" aria-labelledby="model-title">
   <header class="dialog-heading"><h2 id="model-title">모델 가정과 출처</h2><form method="dialog"><button>닫기</button></form></header>
   <div class="notes-grid">
-          <section><h3>공통</h3><p>스타트 라인은 왼쪽 핀마크에서 오른쪽 RC 보트까지 이어집니다. RC 보트는 수신 전용 주 수집기입니다. 경기정이 위치 패킷을 송신하고 수집기가 받습니다. BLE 중계는 경기정에서 이루어집니다. ILCA 대형의 라인 길이는 척수 × 4.24m × 1.5입니다. 풍상 마크까지 기본 1,100m는 변경 가능한 가정입니다. 위치 패킷을 하나 이상의 수집기에 전달하는 상황입니다. 수집기 사이의 유선·인터넷 연결은 충분하다고 가정합니다. 이동 속도 0이면 정지하고, 그 외에는 배별 고정 속도(입력 기준의 70–130%)로 이동합니다. 첫 업윈드의 일부 경기정은 택합니다. 풍하에서는 G3의 두 부표 사이로 들어가 3S 또는 3P의 바깥으로 돌아 나옵니다. 게이트 폭 42.4m와 기본 중심 위치 풍상 93m는 ILCA 운영 지침 §6.5–6.6에 따릅니다. 코스 재생에서는 M1 회항부터 G3까지 볼 수 있고, 풍하 게이트 회항 배치에서는 게이트에 확대됩니다. 배의 속도·파도 위상은 같은 시드에서 재현됩니다. 경기 리플레이에서 관찰한 분포를 바탕으로 만든 가상 장면입니다. 장면별로 재생하며 배 사이 충돌 회피는 계산 범위에서 제외합니다. 범위는 자유공간 손실과 두 경로 원거리 근사의 큰 값을 사용합니다.</p><p>평가 간격은 0.1–5초이며 계산이 길면 완료 후 이어서 실행합니다. 요청 간격은 모의 시간이나 RF 이벤트 해상도와 다릅니다. 장면 재생·슬라이더는 한 평가 안의 배 이동과 파도를 보여주며, 도착률과 경로는 구간 전체 집계입니다. 각 평가는 선택한 모의 시간 전체를 계산합니다. 목표는 생성 후 1초 안에 도착한 완전한 패킷의 비율입니다. TDMA 패킷은 할당 슬롯 시작에 생성하며, 센서 샘플이 그 슬롯을 기다리는 시간은 포함하지 않습니다. 갱신 공백은 관측 시작과 끝을 포함해 1초 안에 들어온 패킷 사이의 시간으로 계산합니다. 평가 구간 안에 그런 도착이 없는 배의 공백은 구간 전체입니다.</p></section>
+          <section><h3>공통</h3><p>스타트 라인은 왼쪽 핀마크에서 오른쪽 RC 보트까지 이어집니다. RC 보트는 수신 전용 주 수집기입니다. 경기정이 위치 패킷을 송신하고 수집기가 받습니다. BLE 중계는 경기정에서 이루어집니다. ILCA 대형의 라인 길이는 척수 × 4.24m × 1.5입니다. 풍상 마크까지 기본 1,100m는 변경 가능한 가정입니다. 위치 패킷을 하나 이상의 수집기에 전달하는 상황입니다. 수집기 사이의 유선·인터넷 연결은 충분하다고 가정합니다. 이동 속도 0이면 정지하고, 그 외에는 배별 고정 속도(입력 기준의 70–130%)로 이동합니다. 첫 업윈드의 일부 경기정은 택합니다. 풍하에서는 G3의 두 부표 사이로 들어가 3S 또는 3P의 바깥으로 돌아 나옵니다. 게이트 폭 42.4m와 기본 중심 위치 풍상 93m는 ILCA 운영 지침 §6.5–6.6에 따릅니다. 코스 재생에서는 M1 회항부터 G3까지 볼 수 있고, 풍하 게이트 회항 배치에서는 게이트에 확대됩니다. 배의 속도·파도 위상은 같은 시드에서 재현됩니다. 경기 리플레이에서 관찰한 분포를 바탕으로 만든 가상 장면입니다. 장면별로 재생하며 배 사이 충돌 회피는 계산 범위에서 제외합니다. 범위는 자유공간 손실과 두 경로 원거리 근사의 큰 값을 사용합니다.</p><p>평가 간격은 0.1–5초이며 계산이 길면 완료 후 이어서 실행합니다. 요청 간격은 모의 시간이나 RF 이벤트 해상도와 다릅니다. 장면 재생·슬라이더는 한 평가 안의 배 이동과 파도를 보여주며, 도착률과 경로는 구간 전체 집계입니다. 각 평가는 선택한 모의 시간 전체를 계산합니다. 목표는 생성 후 1초 안에 도착한 완전한 패킷의 비율입니다. 실제 송신은 보고를 생성한 배가 전파 송신을 시작했을 때 한 번 기록합니다. 기본 LoRa TDMA에서는 슬롯에 맞춰 보고를 생성합니다. 동시 요청 조건에서는 발생 시점부터 슬롯 대기를 포함합니다. 매 1초 고정 구간의 전원 수신 조건은 해당 구간에 예정된 패킷을 같은 구간에 실제 송신하고 수집기가 기한 내에 받은 배를 기준으로 계산합니다. 한 구간이라도 미달하면 최선 후보에서 제외합니다. 갱신 공백은 배별 첫 송신 예정 시점부터 평가 종료까지의 정시 수신을 기준으로 계산합니다.</p></section>
           <section><h3>파도 · 이동</h3><p>유의파고 Hm0와 대표 주기로 만든 3성분 파형을 사용합니다. 장기 수면 변위 표준편차를 Hm0/4로 맞춘 예시이며, 짧은 평가 창에서 같은 파고 통계가 나오지는 않습니다. 실제 해양 스펙트럼이나 ILCA 선체 운동 모델이 아닙니다.</p><p>전파 상태를 모의 시간 0.1초마다 갱신합니다. 배는 수면을 따라 움직인다고 가정하고, 경기정 안테나는 기본 수면 위 0.8m ±0.2m에서 배마다 배정합니다. 같은 시드로 두 방식에 같은 높이를 적용합니다. 배의 기울기를 수면 위 유효 수직 높이와 방사 방향에 반영합니다. 선수방향에 맞춰 회전한 수직 안테나 축을 링크에 수직인 평면에 투영해 양쪽 안테나의 결합을 계산합니다. 안테나 차폐는 설정한 방향을 중심으로 완만하게 줄어드는 가상 손실입니다. 기본은 선미 4dB이며 장착 실측값에 맞춰 조절할 수 있습니다. 파도에 따른 추가 페이딩도 계산하며, 진행 중인 긴 패킷도 감도·간섭 조건을 다시 검사합니다. 기울기 RMS 12°/m(±70° 제한), 파도 페이딩 척도 3dB/m, 수집기 기울기 50%는 실측하지 않은 가정입니다. 파고가 커져도 특정 표본의 도착률이 반드시 낮아지지는 않습니다. 정적 링크 페이딩 σ는 별도로 유지합니다.</p></section><section><h3>LoRa</h3><p>암시적 헤더, CRC 켬, 프리앰블 8심볼. SF·BW·CR로 실제 수식의 패킷 시간을 계산합니다. 수신감도는 SX1262의 SF7·SF12 값 사이를 선형 보간합니다. CR은 전송시간에만 반영하며 복호 이득은 제외합니다. 수집기마다 채널 수만큼 독립 수신기가 있다고 가정합니다. TDMA는 각 배에 슬롯을 균등 배정하고 설정한 송신 지터의 절댓값을 지연으로 더합니다. ALOHA는 배별 임의 위상의 주기 송신입니다. 배 사이의 LoRa 중계, ACK, CAD, PPS 상실·가입 절차는 구현하지 않았습니다.</p><p>인접 채널은 대역이 겹치면 억압 0dB, 겹치지 않으면 입력한 억압값을 사용합니다. 캡처 임계값과 인접 억압값은 측정값이 아닙니다. SF 혼용 수신·수신기 포화·법규 적합성은 별도 검증 대상입니다.</p></section>
           <section><h3>BLE Mesh</h3><p>1M PHY의 레거시 광고 37·38·39 채널을 사용한 관리형 플러딩 근사입니다. 하나의 수신기가 10ms씩 채널을 순환합니다. TTL, 중계 비율, 중복 캐시 256개, 반복 송신, 반이중 송수신, 큐 제한, 분할·재조립을 계산합니다. 3바이트 vendor opcode와 4바이트 TransMIC를 더하며, 24바이트 데이터는 3개 세그먼트입니다. 그룹 전송으로 SAR ACK는 없습니다.</p><p>Coded PHY, BLE 연결형 메쉬, Directed Forwarding, Vakaros의 독자 프로토콜은 재현하지 않습니다. 모든 기기는 등록 완료 상태입니다. 전력 소모·충전·설정 시간은 계산하지 않습니다.</p></section>
           <section><h3>충돌과 탐색</h3><p>패킷 시간 겹침과 수신 전력 합으로 간섭을 계산하며, 임계 SIR 미만 또는 수신 중 자기 송신이면 실패합니다. 세부 복조기·패킷 내 오류율은 근사입니다. 채널 부하는 송신시간의 합으로, 중첩과 공간 재사용 때문에 100%를 넘을 수 있습니다. BLE 지도에는 재조립을 완료한 마지막 세그먼트의 경로를 표시합니다.</p><p>미갱신 척수가 같으면 최장 갱신 공백, 1초 내 도착률, P95 지연 순으로 우선합니다. 두 방식 평가에서는 각 지표의 불리한 값을 사용합니다. 이력 그래프의 세로축은 도착률입니다. 기본 탐색은 체크한 항목마다 지정한 최소·최대 또는 선택한 후보 안에서 무작위로 뽑습니다. 같은 범위로 순차 비교나 주변 탐색을 실행할 수도 있습니다. 순차 비교는 다른 항목을 매번 원래 기준으로 복원하며 전체 조합을 검사하지 않습니다. 주변 탐색에서 나빠진 후보도 이력에 남기되 다음 후보는 보관한 해에서 출발합니다. 22% 확률로 다른 구간을 무작위 탐색해 국소 정체를 벗어날 기회를 둡니다. 순차 전용은 한 바퀴 후 자동 정지합니다. 무작위 전용과 고정 조건·새 시드 반복도 선택할 수 있습니다. 선택 범위 안에서 발견한 극값이며 전역 최적값이 아닙니다. 계산 이벤트 한도를 넘긴 평가는 극값 선정에서 제외합니다. 체크하지 않은 배치·이동·파도·통신 설정은 고정하며, 탐색 중 시드도 고정합니다. 다른 시드 검증은 배치의 미세 위치, 중계선 선정, 속도 편차, 파도 위상, 페이딩, 송신 위상도 바꿉니다. 시드 검증은 표본 변동 점검이며 실측 오차나 신뢰구간이 아닙니다.</p></section>
@@ -166,6 +185,37 @@
 <dialog id="trial-details" aria-labelledby="trial-title">
   <header class="dialog-heading"><h2 id="trial-title">평가 조건 변경 상세</h2><form method="dialog"><button>닫기</button></form></header>
   <p id="trial-full"></p>
+</dialog>
+<dialog id="best-snapshots" aria-labelledby="snapshots-title">
+  <header class="dialog-heading"><h2 id="snapshots-title">최선 후보 스냅샷</h2><form method="dialog"><button>닫기</button></form></header>
+  <label id="snapshot-picker">저장된 후보<select id="snapshot-select"></select></label>
+  <p id="snapshot-summary" class="muted"></p>
+  <button type="button" id="snapshot-replay" disabled>지도에서 다시 보기</button>
+</dialog>
+<dialog id="fast-report" aria-labelledby="fast-report-title">
+  <header class="dialog-heading"><h2 id="fast-report-title">고속 탐색 실패 분석</h2><form method="dialog"><button autofocus>닫기</button></form></header>
+  <div class="fast-report-scope">
+    <p id="fast-report-summary"></p>
+    <label id="fast-report-picker"><span class="sr-only">분석할 통신 방식</span><select id="fast-report-radio"></select></label>
+  </div>
+  <p class="muted">1초 내 미수신 경기정마다 1건 · 원인은 모델 추정</p>
+  <dl class="fast-counts failure-counts">
+    <div><dt>미송신</dt><dd id="fast-cause-unsent">0건</dd></div>
+    <div><dt>1초 초과</dt><dd id="fast-cause-overtime">0건</dd></div>
+    <div><dt>충돌</dt><dd id="fast-cause-collision">0건</dd></div>
+    <div><dt>신호 부족</dt><dd id="fast-cause-weak">0건</dd></div>
+  </dl>
+  <p id="fast-report-other" class="muted" hidden></p>
+  <p id="fast-report-nearest" hidden></p>
+  <p id="fast-report-empty" class="muted" hidden>이 방식에서 분석할 실패 회차가 없습니다.</p>
+  <table id="fast-report-table">
+    <caption class="sr-only">실패 회차별 원인</caption>
+    <thead><tr><th scope="col">회차</th><th scope="col">수신</th><th scope="col">추정 원인</th></tr></thead>
+    <tbody id="fast-report-rows"></tbody>
+  </table>
+  <nav id="fast-report-pages" aria-label="실패 회차 페이지" hidden>
+    <button type="button" id="fast-report-prev">이전</button><output id="fast-report-page"></output><button type="button" id="fast-report-next">다음</button>
+  </nav>
 </dialog>
 <dialog id="range-dialog" aria-labelledby="range-title">
   <header class="dialog-heading"><h2 id="range-title">자동 탐색 범위</h2><button type="button" id="close-range">닫기</button></header>

@@ -1,11 +1,12 @@
 {
-  "modelVersion": "0.9.0",
+  "modelVersion": "0.9.3",
   "reviewed": "2026-11-19",
   "purpose": "Protocol and geometry screening; empirical sea-trial calibration is still required.",
   "sources": [
     {
       "title": "Semtech SX1261/2 datasheet Rev 2.2, December 2024",
       "url": "https://www.semtech.com/products/wireless-rf/lora-connect/sx1262",
+      "localReviewedCopy": "../output/antenna-layout/fleet-radio-research/sx1261-2-rev2-2.pdf",
       "usedFor": "LoRa sensitivity table and packet-time parameters; CW rejection values are NOT treated as LoRa-on-LoRa measured rejection."
     },
     {

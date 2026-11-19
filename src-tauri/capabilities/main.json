@@ -1,0 +1,5 @@
+{
+  "identifier": "simulator-local-files",
+  "windows": ["main"],
+  "permissions": ["allow-save-record", "allow-open-record"]
+}

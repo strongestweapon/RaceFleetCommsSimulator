@@ -1,13 +1,14 @@
 import { DEFAULTS, SPACE, Explorer, MODEL_VERSION, rankResult, normalize, normalizeSearchLimits, parameterValues, isSliderParameter, makeScene, nodeState, createPropagation, antennaLoss } from './engine.js';
 import { ILCA_LAYOUTS, routeLength } from './ilca-course.js';
 const $ = id => document.getElementById(id);
-const labels = {ilcaStart:'ILCA · 스타트 밀집',ilcaBeat:'ILCA · 첫 업윈드',ilcaMark:'ILCA · 풍상 마크 회항',ilcaDownwind:'ILCA · 풍하 레그',ilcaLeeward:'ILCA · 풍하 게이트 회항',spread:'균일 격자',start:'압축 격자',split:'분리 격자',leader:'선두 독주',chain:'일렬 연결',tdma:'TDMA · 시각 동기',aloha:'ALOHA · 비동기',bow:'선수',stern:'선미',port:'좌현',starboard:'우현'};
+const desktopInvoke = window.__TAURI__?.core?.invoke;
+const labels = {ilcaStart:'ILCA · 스타트 밀집',ilcaBeat:'ILCA · 첫 업윈드',ilcaMark:'ILCA · 풍상 마크 회항',ilcaDownwind:'ILCA · 풍하 레그',ilcaLeeward:'ILCA · 풍하 게이트 회항',spread:'균일 격자',start:'압축 격자',split:'분리 격자',leader:'선두 독주',chain:'일렬 연결',tdma:'TDMA · 시각 동기',aloha:'ALOHA · 비동기',bow:'선수',stern:'선미',port:'좌현',starboard:'우현',default:'기본 분산',grouped:'4그룹 동시',synchronized:'전부 동시'};
 const fields = [
  ['boats','배 척수','척','common'], ['spacing','대형 폭 기준','m','common'],
  ['layout','배치','','common'], ['collectors','수집기','대','common'],
  ['legLength','첫 업윈드 길이','m','common'], ['leewardOffset','풍하 게이트 위치','m','common'],
  ['speed','이동 속도 기준','kn','common'], ['waveHeight','파도 세기 · 유의파고 Hm0','m','common'],
- ['wavePeriod','대표 파도 주기','초','common'],
+ ['wavePeriod','대표 파도 주기','초','common'], ['reportTiming','송신 요청 시점','','common'],
  ['hz','배당 송신 빈도','Hz','link'], ['payload','순수 데이터','B','link'],
  ['power','송신 출력','dBm','model'], ['boatHeight','경기정 기준 높이','m','model'],
  ['boatHeightSpread','장착 높이 편차','m','model'],
@@ -20,26 +21,36 @@ const fields = [
  ['antennaShadow','최대 차폐 손실','dB','model'], ['shadowSide','차폐 중심 방향','','model'],
  ['fade','링크 페이딩 σ','dB','link'], ['bleSensitivity','BLE 1M 수신감도','dBm','link'],
  ['channelSpacing','LoRa 채널 중심 간격','MHz','link'], ['adjacent','비중첩 채널 억압 가정','dB','link'],
- ['capture','간섭 대비 필요 전력차','dB','link'], ['queueMs','최대 송신 대기','ms','link'],
- ['duration','모의 시간','초','search']
+ ['capture','간섭 대비 필요 전력차','dB','link'], ['queueMs','최대 송신 대기','ms','link']
 ];
+const configurableKeys = new Set(fields.map(([key])=>key));
 const defaultKeys = ['sf','bw','channels','relays','ttl','repeats'];
 let saved = {}; try { saved = JSON.parse(localStorage.getItem('sailing-radio-lab-v1') || '{}'); } catch {}
+const snapshotKey='sailing-radio-lab-best-v1';
+let bestSnapshots=[];
+let snapshotChoices=[];
+try {
+ const stored=JSON.parse(localStorage.getItem(snapshotKey)||'[]');
+ if(Array.isArray(stored))bestSnapshots=stored;
+} catch {}
 // Switch the former default once; subsequently selected comparison grids stay selected.
 if (!saved.modelVersion && saved.base?.layout === 'spread') saved.base.layout = DEFAULTS.layout;
 if(saved.base && saved.base.boatHeightSpread===undefined){
  if(saved.base.boatHeight===1.2) saved.base.boatHeight=DEFAULTS.boatHeight;
  else if(saved.base.boatHeight!==undefined) saved.base.boatHeightSpread=0;
 }
-let base = normalize(saved.base), keys = new Set((saved.keys || defaultKeys).filter(k=>Object.hasOwn(SPACE,k))), target = saved.target || 'both';
+let base = normalize({...saved.base,duration:1,deadline:1}), keys = new Set((saved.keys || defaultKeys).filter(k=>configurableKeys.has(k))), target = saved.target || 'both';
 let searchLimits = normalizeSearchLimits(saved.searchLimits);
 let explorer, current = null, replay = null, records = [], running = false, busy = false, timer = null, generation = 0;
 let kind = 'ble', selected = 0, view = 'current', evaluationMs = 0, needBaseline = false, validating = false;
 let sceneTime = 0, sceneTimer = null, sceneStart = 0, lastStart = null, actualCadence = null, cadences = [], displayedPropagation = null;
 let courseReplay = null;
 let worker = new Worker(new URL('./worker.js', import.meta.url), {type:'module'}), jobId = 0;
+let fastSession = null;
+let lastFastReport = null, fastReportPage = 0;
 const pending = new Map();
 const narrowLayout = matchMedia('(max-width: 760px)');
+const consoleView = document.querySelector('.console');
 const workspace = document.querySelector('.workspace');
 const tabs = Array.from(document.querySelectorAll('.dock-nav [role="tab"]'));
 let activeTab = narrowLayout.matches ? 'map' : 'result';
@@ -224,7 +235,7 @@ function syncFields(config){
  $('p-spacing').setAttribute('aria-label',ilca?'대형 폭 기준':'배 간격 척도');
 }
 function resolveStrategy(strategy, version) {
- if (strategy==='hybrid' && !['0.7.0','0.8.0','0.8.1',MODEL_VERSION].includes(version)) return 'random';
+ if (strategy==='hybrid' && !['0.7.0','0.8.0','0.8.1','0.9.0','0.9.2',MODEL_VERSION].includes(version)) return 'random';
  return ['hybrid','sequential','local','random'].includes(strategy)?strategy:'random';
 }
 function persist(){ try{localStorage.setItem('sailing-radio-lab-v1',JSON.stringify({modelVersion:MODEL_VERSION,base,keys:[...keys],searchLimits,target,strategy:$('strategy').value}));}catch{} }
@@ -235,18 +246,26 @@ function completedLabel(){
  return keys.size?'체크한 값이 모두 고정됨':'자동 탐색 변수 없음';
 }
 function updateButtons(){
- $('run').textContent=running?'일시정지':'탐색 시작';
- $('run').disabled=!current || validating || explorer?.done;
- $('step').disabled=busy || running || explorer?.done;
+ if(fastSession)return;
+ $('fast-run').disabled=validating;
+ $('run').textContent=running?'탐색 정지':'탐색';
+ $('run').disabled=!current || validating;
  $('validate').disabled=busy || running || !displayResult();
  $('run-state').textContent=validating?'다른 시드 검증 중':busy?'조건 평가 중':explorer?.done?completedLabel():running?'자동 탐색 중':'일시정지';
  $('run-state').dataset.active=String(running || busy);
  $('open-trial').disabled=!displayResult();
  $('course-playback').disabled=busy && !courseReplay;
+ $('case-view').querySelector('option[value="best"]').disabled=!explorer?.best;
+ $('best-card').disabled=!explorer?.best;
+ $('snapshot-replay').disabled=busy||!$('snapshot-select').value;
 }
 function resetSearch(){
  stop();clearSceneReplay();lastStart=null;actualCadence=null;cadences=[];generation++;records=[];current=null;replay=null;view='current';$('case-view').value='current';syncCourseMode(null);
- target=$('objective').value;explorer=new Explorer(base,[...keys],target,$('search-mode').value,$('strategy').value,searchLimits);
+ $('map-case').textContent='기준 평가 중';$('map-case').dataset.tone='';
+ $('case-verdict').hidden=true;$('metric-fleet').textContent='—';$('metric-packet-flow').textContent='—';
+ $('metric-search-total').textContent='성공 횟수 0회';
+ $('metric-received').textContent=$('metric-isolated').textContent=$('metric-unsent').textContent='—';
+ target=$('objective').value;explorer=new Explorer({...base,duration:1,deadline:1},[...keys],target,$('search-mode').value,$('strategy').value,searchLimits);
  base=explorer.base;needBaseline=true;
  $('validation-result').textContent='탐색 중에는 같은 시드로 비교합니다.';
  $('error').hidden=true;persist();syncFields(base);syncSearchLimitLabels();updateButtons();drawHistory();
@@ -258,8 +277,9 @@ async function stepSearch(){
  try{
   const data=await request(proposal.config);if(token!==generation)return;
   evaluationMs=data.elapsed;const accepted=explorer.accept(data.result);current={...data.result,rank:accepted.rank,iteration:accepted.iteration,proposal,acceptance:accepted};
-  records.push({iteration:accepted.iteration,score:accepted.score,rank:accepted.rank,best:explorer.best?.score??null,worst:explorer.worst?.score??null,config:data.result.config,lora:data.result.lora.pdr,ble:data.result.ble.pdr,goal:proposal.goal,proposal,acceptance:accepted,elapsedMs:data.elapsed});
+  records.push({iteration:accepted.iteration,score:accepted.score,rank:accepted.rank,best:explorer.best?.score??null,config:data.result.config,lora:data.result.lora.pdr,ble:data.result.ble.pdr,goal:proposal.goal,proposal,acceptance:accepted,elapsedMs:data.elapsed});
   if(records.length>2000)records.shift();if(explorer.done)stop();render();
+  if(accepted.improved)saveBestSnapshot(current);
  }catch(error){if(token===generation){showError(error.message);stop();}}
  finally{
   busy=false;updateButtons();
@@ -267,8 +287,156 @@ async function stepSearch(){
   if(running && token===generation)timer=setTimeout(stepSearch,Math.max(0,Number($('pace').value)-(performance.now()-start)));
  }
 }
-$('run').onclick=()=>{if(running){stop();return;}running=true;lastStart=null;view='current';$('case-view').value=view;updateButtons();if(!busy)timer=setTimeout(stepSearch,Number($('pace').value));};
-$('step').onclick=()=>stepSearch();$('reset').onclick=()=>resetSearch();
+$('run').onclick=()=>{
+ if(running){stop();return;}
+ if(explorer.done)resetSearch();
+ running=true;lastStart=null;view='current';$('case-view').value=view;
+ updateButtons();
+ if(!busy)timer=setTimeout(stepSearch,Number($('pace').value));
+};
+function stopFast(session){
+ session.stopping=true;
+ $('fast-run').textContent='정지 중';
+ $('fast-run').disabled=true;
+ session.worker.postMessage({type:'fast-stop'});
+}
+const fastCauseLabels={unsent:'미송신',overtime:'1초 초과',collision:'충돌',weak:'신호 부족',unplanned:'송신 예정 없음',other:'기타'};
+const fastReportPageSize=4;
+function renderFastReport(){
+ const {reports,iteration,passed,excluded,saved,target:scope}=lastFastReport;
+ const report=reports[$('fast-report-radio').value];
+ const failed=iteration-passed-excluded;
+ const skipped=excluded?` · 계산 한도 제외 ${fmt(excluded)}회`:'';
+ $('fast-report-summary').textContent=`${targetLabel(scope)} · 평가 ${fmt(iteration)}회 · 성공 ${fmt(passed)}회 · 실패 ${fmt(failed)}회 · 새 스냅샷 ${fmt(saved)}개${skipped}`;
+ for(const cause of ['unsent','overtime','collision','weak'])$(`fast-cause-${cause}`).textContent=`${fmt(report.counts[cause]??0)}건`;
+ $('fast-report-other').textContent=['unplanned','other'].filter(cause=>report.counts[cause]).map(cause=>`${fastCauseLabels[cause]} ${fmt(report.counts[cause])}건`).join(' · ');
+ $('fast-report-other').hidden=!$('fast-report-other').textContent;
+ const nearest=report.nearest;
+ $('fast-report-nearest').hidden=!nearest;
+ if(nearest){
+  const {example}=nearest;
+  const timing=example.cause==='overtime' && example.transmittedAt!==null && example.endsAt!==null
+   ? ` · 송신 시작 ${fmt(example.transmittedAt*1000,1)}ms · 예상 종료 ${fmt(example.endsAt*1000,1)}ms`:'';
+  $('fast-report-nearest').textContent=`가장 근접 #${fmt(nearest.iteration)} · ${fmt(nearest.received)}/${fmt(nearest.expected)}척 수신 · ${fmt(example.boat)}번 배 ${fastCauseLabels[example.cause]}${timing}`;
+ }
+ const {rows}=report;
+ $('fast-report-empty').hidden=Boolean(rows.length);
+ $('fast-report-table').hidden=!rows.length;
+ const totalPages=Math.ceil(rows.length/fastReportPageSize);
+ $('fast-report-pages').hidden=totalPages<=1;
+ $('fast-report-prev').disabled=fastReportPage===0;
+ $('fast-report-next').disabled=fastReportPage+1>=totalPages;
+ $('fast-report-page').textContent=`${fmt(fastReportPage+1)} / ${fmt(totalPages)}`;
+ const entries=[];
+ const end=rows.length-fastReportPage*fastReportPageSize;
+ for(let i=end-1;i>=Math.max(0,end-fastReportPageSize);i--){
+  const {iteration,received,expected,counts}=rows[i];
+  const reasons=Object.entries(counts).filter(([,count])=>count>0)
+   .map(([cause,count])=>`${fastCauseLabels[cause]} ${fmt(count)}건`).join(' · ');
+  const tr=document.createElement('tr');
+  for(const value of [`#${fmt(iteration)}`,`${fmt(received)}/${fmt(expected)}척`,reasons]){
+   const td=document.createElement('td');
+   td.textContent=value;
+   tr.append(td);
+  }
+  entries.push(tr);
+ }
+ $('fast-report-rows').replaceChildren(...entries);
+}
+function openFastReport(){
+ fastReportPage=0;
+ renderFastReport();
+ $('fast-report').showModal();
+}
+$('open-fast-report').onclick=openFastReport;
+$('fast-report-radio').onchange=()=>{fastReportPage=0;renderFastReport();};
+$('fast-report-prev').onclick=()=>{fastReportPage--;renderFastReport();};
+$('fast-report-next').onclick=()=>{fastReportPage++;renderFastReport();};
+function finishFast(session,error){
+ session.worker.terminate();
+ fastSession=null;
+ delete consoleView.dataset.fast;
+ workspace.hidden=false;
+ $('fast-panel').hidden=true;
+ $('fast-run').textContent='고속 탐색';
+ $('pace').disabled=false;
+ $('iteration').textContent=fmt(explorer.iteration);
+ $('last-fast-status').textContent=`고속 탐색 · 평가 ${fmt(session.iteration)}회 · 성공 ${fmt(session.passed)}회 · 새 스냅샷 ${fmt(session.saved)}개`;
+ $('last-fast-status').hidden=false;
+ if(error)showError(error);
+ render();
+ updateButtons();
+ if(!error || session.iteration){
+  const {reports,iteration,passed,excluded,saved,target}=session;
+  lastFastReport={reports,iteration,passed,excluded,saved,target};
+  const radios=Object.keys(reports);
+  const firstRadio=radios.reduce((current,radio)=>reports[radio].rows.length>reports[current].rows.length?radio:current);
+  $('fast-report-radio').replaceChildren(...radios.map(radio=>new Option(targetLabel(radio),radio)));
+  $('fast-report-radio').value=firstRadio;
+  $('fast-report-picker').hidden=radios.length<2;
+  $('open-fast-report').hidden=false;
+  openFastReport();
+ }
+}
+$('fast-run').onclick=()=>{
+ if(fastSession){stopFast(fastSession);return;}
+ stop();
+ stopScene();
+ const mode=$('search-mode').value;
+ const config=mode==='repeat'?base:explorer.best?.config??base;
+ const fastWorker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});
+ const radios=target==='both'?['lora','ble']:[target];
+ const reports=Object.fromEntries(radios.map(radio=>[radio,{rows:[],counts:{},nearest:null}]));
+ const session={worker:fastWorker,target,iteration:0,passed:0,saved:0,excluded:0,reports};
+ lastFastReport=null;
+ $('open-fast-report').hidden=true;
+ $('last-fast-status').hidden=true;
+ fastSession=session;
+ $('error').hidden=true;
+ consoleView.dataset.fast='true';
+ workspace.hidden=true;
+ $('fast-panel').hidden=false;
+ $('fast-target').textContent=`${targetLabel(target)} · 1초 전원 수신`;
+ for(const id of ['iteration','fast-iterations','fast-successes','fast-saved'])$(id).textContent='0';
+ $('run').disabled=true;
+ $('pace').disabled=true;
+ $('fast-run').textContent='고속 탐색 정지';
+ $('run-state').textContent='고속 탐색 중';
+ $('run-state').dataset.active='true';
+ fastWorker.onmessage=({data})=>{
+  if(fastSession!==session)return;
+  session.iteration=data.iteration;
+  session.passed=data.passed;
+  session.excluded=data.excluded;
+  for(const [radio,report] of Object.entries(data.reports)){
+   const collected=session.reports[radio];
+   collected.rows.push(...report.rows);
+   collected.counts=report.counts;
+   collected.nearest=report.nearest;
+  }
+  if(!session.error){
+   try{
+    for(const snapshot of data.snapshots){
+     if(saveBestSnapshot(snapshot,session.target))session.saved++;
+    }
+   }catch(error){
+    session.error=error.message;
+    if(data.type==='fast-progress'&&!session.stopping)stopFast(session);
+   }
+  }
+  $('iteration').textContent=$('fast-iterations').textContent=fmt(session.iteration);
+  $('fast-successes').textContent=fmt(session.passed);
+  $('fast-saved').textContent=fmt(session.saved);
+  if(data.type==='fast-done'){
+   const error=['complete','stopped'].includes(data.reason)?null:`고속 탐색 오류 · ${data.reason}`;
+   finishFast(session,session.error??error);
+  }
+ };
+ fastWorker.onerror=event=>{
+  if(fastSession===session)finishFast(session,`고속 탐색 오류 · ${event.message}`);
+ };
+ fastWorker.postMessage({type:'fast-start',config,target,keys:[...keys],mode,strategy:$('strategy').value,limits:searchLimits});
+};
 $('objective').value=target;$('objective').onchange=()=>resetSearch();$('search-mode').onchange=()=>resetSearch();
 $('strategy').value=resolveStrategy(saved.strategy,saved.modelVersion);$('strategy').onchange=()=>resetSearch();
 $('pace').onchange=()=>{persist();if(running&&!busy){clearTimeout(timer);timer=setTimeout(stepSearch,Number($('pace').value));}render();};
@@ -281,22 +449,94 @@ $('show-links').onchange=()=>{
  drawSea();
 };
 $('boat-select').onchange=()=>{selected=Number($('boat-select').value);drawSea();showBoat();};
-for (const which of ['best', 'worst']) {
- $(which+'-card').onclick=()=>{
-  if(!explorer[which])return;
-  view=which;
+ $('best-card').onclick=()=>{
+  if(!explorer.best)return;
+  view='best';
   $('case-view').value=view;
   if(narrowLayout.matches)selectTab('map');
   render();
  };
-}
-function displayResult(){return view==='best'?explorer?.best:view==='worst'?explorer?.worst:view==='replay'?replay:current;}
+function displayResult(){return view==='best'?explorer?.best:view==='replay'?replay:current;}
+function fleetScore(report){return `${report.fleet.complete}/${report.fleet.rounds.length}`;}
+function fleetPassed(report){return report.fleet.complete===report.fleet.rounds.length;}
+function targetLabel(value){return value==='both'?'BLE·LoRa 모두':value==='ble'?'BLE Mesh':'LoRa';}
 function configSummary(c){return `${c.boats}척 · ${c.spacing}m · 파고 ${c.waveHeight}m · ${c.speed}kn · SF${c.sf}/${c.bw}k · ${c.channels}ch · 중계 ${c.relays}% / TTL ${c.ttl} / ${c.repeats}회`;}
+function snapshotSelection(){
+ const selectedValue=$('snapshot-select').value;
+ return selectedValue===''?null:snapshotChoices[Number(selectedValue)];
+}
+function saveBestSnapshot(result,snapshotTarget=target){
+ if(!result.rank?.feasible)return false;
+ const configKey=JSON.stringify(result.config);
+ if(bestSnapshots.some(snapshot=>snapshot.target===snapshotTarget && snapshot.modelVersion===MODEL_VERSION && JSON.stringify(snapshot.config)===configKey))return false;
+ const snapshot={savedAt:new Date().toISOString(),modelVersion:MODEL_VERSION,iteration:result.iteration,target:snapshotTarget,config:result.config,rank:result.rank};
+ storeSnapshot(snapshot);
+ return true;
+}
+function storeSnapshot(snapshot){
+ const next=[snapshot,...bestSnapshots];
+ try{
+  localStorage.setItem(snapshotKey,JSON.stringify(next));
+ }catch(error){throw new Error(`스냅샷 저장 실패 · ${error.message}`);}
+ bestSnapshots=next;
+ $('open-snapshots').textContent=`스냅샷 ${fmt(bestSnapshots.length)}개`;
+}
+async function loadValidationSnapshot(){
+ try{
+  const response=await fetch(new URL('./lora-100-best-snapshot.json',import.meta.url));
+  if(!response.ok)throw new Error(`HTTP ${response.status}`);
+  const snapshot=await response.json();
+  if(!bestSnapshots.some(saved=>saved.id===snapshot.id))storeSnapshot(snapshot);
+ }catch(error){showError(`검증 스냅샷을 열지 못했습니다 · ${error.message}`);}
+}
+function showSnapshotSummary(){
+ const snapshot=snapshotSelection();
+ const heldOut=snapshot?.validation?.heldOut;
+ const nominal=heldOut?.jitter?.[snapshot.config.jitter];
+ const nominalLabel=nominal?`\n기준 지터 ${snapshot.config.jitter}ms · ${fmt(nominal.pass)}/${fmt(nominal.total)}회 통과`:'';
+ const validation=heldOut?`\n별도 시드 검증 ${fmt(heldOut.pass)}/${fmt(heldOut.total)}회 통과${nominalLabel}`:'';
+ $('snapshot-summary').textContent=snapshot
+  ?`${configSummary(snapshot.config)}\n${snapshot.config.duration}초 시험 · ${labels[snapshot.config.reportTiming]} · ${labels[snapshot.config.mac]} · 시드 ${snapshot.config.seed}\n${rankSummary(snapshot.rank,false)}${validation}`
+  :'아직 전원 수신 조건을 통과한 스냅샷이 없습니다.';
+ $('snapshot-replay').disabled=!snapshot||busy;
+}
+$('open-snapshots').textContent=bestSnapshots.length?`스냅샷 ${fmt(bestSnapshots.length)}개`:'스냅샷';
+$('open-snapshots').onclick=()=>{
+ snapshotChoices=bestSnapshots;
+ $('snapshot-select').replaceChildren(...snapshotChoices.map((snapshot,index)=>new Option(snapshot.label??`${new Date(snapshot.savedAt).toLocaleString('ko-KR')} · ${targetLabel(snapshot.target)} · #${snapshot.iteration}`,index)));
+ $('snapshot-picker').hidden=!snapshotChoices.length;
+ showSnapshotSummary();
+ $('best-snapshots').showModal();
+};
+$('snapshot-select').onchange=showSnapshotSummary;
+$('snapshot-replay').onclick=()=>{
+ const snapshot=snapshotSelection();
+ if(busy||!snapshot)return;
+ $('best-snapshots').close();
+ replayCase(snapshot,true);
+};
 function rankSummary(rank, includeMissing=true) {
  if (!rank) return '평가 제외';
  const delay = rank.latency95 === null ? '—' : `${fmt(rank.latency95 * 1000)}ms`;
  const coverage=includeMissing?`미갱신 ${rank.missing}척 · `:'';
- return `${coverage}공백 ${rank.gap.toFixed(2)}초 · 도착 ${pct(rank.pdr)} · P95 ${delay}`;
+ return `전원 수신 ${pct(rank.fleetComplete)} · ${coverage}공백 ${rank.gap.toFixed(2)}초 · 도착 ${pct(rank.pdr)} · P95 ${delay}`;
+}
+function showDisplayedCase(result){
+ const goal=result.proposal?.goal;
+ const savedLabel=view==='best'||result.snapshot?'보관한 최선':null;
+ const candidates={baseline:'기준 평가',best:'탐색 후보',sweep:'순차 비교 후보',repeat:'새 시드 평가'};
+ const label=savedLabel ?? candidates[goal] ?? '현재 평가';
+ const replayPrefix=view==='replay'?(result.snapshot?'스냅샷 ':'이력 '):'';
+ const badge=$('map-case');
+ badge.textContent=`${replayPrefix}#${result.iteration} · ${label}`;
+ badge.dataset.tone=savedLabel?'best':goal??'';
+ const verdict=$('case-verdict');
+ verdict.hidden=false;
+ verdict.dataset.state=!result.rank?'excluded':result.rank.feasible?'pass':'out';
+ const judgedTarget=result.snapshot?.target??target;
+ const scope=judgedTarget==='both'?'양쪽 조건':targetLabel(judgedTarget);
+ verdict.textContent=!result.rank?'평가 제외':`${scope} ${result.rank.feasible?'통과':'탈락'}`;
+ verdict.title=`${targetLabel(judgedTarget)} · 매 1초 전원 수신 기준`;
 }
 function stopScene(){clearInterval(sceneTimer);sceneTimer=null;$('scene-play').textContent='장면 재생';$('scene-play').setAttribute('aria-pressed','false');}
 function clearSceneReplay(){
@@ -312,8 +552,11 @@ function syncCourseMode(result){
  $('course-case').hidden=!active;
  if(active)$('course-case').textContent=courseReplay.config.layout==='ilcaLeeward'?'G3 풍하 게이트 회항':'M1 풍상 → G3 풍하 게이트';
  $('course-legend').hidden=!active;
- $('radio-legend').hidden=active;
- $('scene-time').setAttribute('aria-label',active?'코스 재생 시간':'평가 구간 안의 장면 시간');
+ const excluded=result?.[kind].capped;
+ $('radio-legend').hidden=active||Boolean(excluded);
+ $('excluded-legend').hidden=active||!excluded;
+ $('boat-reception').hidden=active||!result;
+ $('scene-time').setAttribute('aria-label',active?'코스 재생 시간':'지도 재생 시간 · 수신 수치는 평가 구간 전체 집계');
 }
 function coursePose(node){
  const time=Math.min(sceneTime,courseReplay.finishTimes[node.id] ?? sceneTime);
@@ -365,18 +608,30 @@ $('scene-play').onclick=()=>{
  else startScene();
 };
 function render(){
+ if(fastSession)return;
  const result=displayResult();if(!result)return;
  if(courseReplay && courseReplay.result!==result)clearSceneReplay();
  syncCourseMode(result);
  const c=result.config,s=result[kind];syncFields(c);
  $('iteration').textContent=fmt(explorer.iteration);
- $('metric-pdr').textContent=s.capped?'평가 제외':pct(s.pdr);
- $('metric-delivered').textContent=`${fmt(s.timely)} / ${fmt(s.generated)} 패킷`;
- $('metric-isolated').textContent=`${s.missingTimely} / ${c.boats}척`;
- $('metric-gap').textContent=`최장 갱신 공백 ${s.longestTimelyGap.toFixed(2)}초`;
- $('metric-latency').textContent=s.latency95===null?'미도착':`${fmt(s.latency95*1000)}ms`;
- $('metric-hops').textContent=s.meanHops===null?'전달 경로 없음':`평균 ${s.meanHops.toFixed(1)}홉 · ${s.segments}개 세그먼트`;
- $('map-case').textContent=`${view==='best'?'발견한 최선':view==='worst'?'발견한 최악':view==='replay'?'이력 다시 보기':'현재 평가'} · #${result.iteration||explorer.iteration}`;
+ const deadline=`${fmt(c.deadline,2)}초`;
+ $('coverage-label').textContent=`${c.collectors===1?'RC':'수집기'} 정시 수신 · ${fmt(c.duration,2)}초 전체`;
+ $('coverage-label').title=`${fmt(s.scheduledBoats)}척에 송신 예정이 있었습니다. 배별 수신은 ${deadline} 안에 도착한 패킷 기준입니다.`;
+ const oneSecond=s.fleet.rounds.length===1;
+ $('metric-fleet-label').textContent=oneSecond?'이번 1초 수신':'전원 수신 성공 구간';
+ $('metric-fleet').textContent=s.capped?'평가 제외':oneSecond?`${fmt(s.fleet.rounds[0].received)}/${fmt(s.fleet.target)}척`:`${fleetScore(s)}구간`;
+ $('metric-fleet').dataset.state=s.capped?'excluded':fleetPassed(s)?'pass':'out';
+ $('metric-search-total').textContent=`성공 횟수 ${fmt(explorer.passed)}회`;
+ $('metric-search-total').title=`${targetLabel(target)} 전원 수신에 성공한 누적 횟수`;
+ $('metric-packet-flow').textContent=s.capped?'이벤트 한도 초과':`예정 ${fmt(s.generated)} · 송신 ${fmt(s.transmitted)} · 정시 ${fmt(s.timely)}건`;
+ $('metric-packet-flow').title=s.capped?'':`송신 예정 ${fmt(s.generated)}건, 실제 송신 ${fmt(s.transmitted)}건, 수신 ${fmt(s.delivered)}건(정시 ${fmt(s.timely)}건)`;
+ $('metric-received').textContent=s.capped?'—':`${fmt(s.scheduledBoats-s.missingTimely)}척`;
+ $('metric-isolated').textContent=s.capped?'—':`${fmt(s.missingTimely-s.unsentBoats)}척`;
+ $('metric-unsent').textContent=s.capped?'—':`${fmt(s.unsentBoats)}척`;
+ $('metric-gap').textContent=s.capped?'수신 판정 제외':`예정 ${fmt(s.scheduledBoats)}척 · 최장 공백 ${s.longestTimelyGap.toFixed(2)}초`;
+ $('metric-latency').textContent=s.capped?'—':s.latency95===null?'미도착':`${fmt(s.latency95*1000)}ms`;
+ $('metric-hops').textContent=s.capped?'':s.meanHops===null?'전달 경로 없음':`평균 ${s.meanHops.toFixed(1)}홉 · ${s.segments}개 세그먼트`;
+ showDisplayedCase(result);
  $('map-distance').textContent=`최근접 평균 ${fmt(result.scene.nearest)}m · 수집기까지 최대 ${fmt(result.scene.farthest)}m`;
  const options=$('boat-select');if(options.options.length!==c.boats){options.innerHTML=Array.from({length:c.boats},(_,i)=>`<option value="${i}">배 ${i+1}</option>`).join('');}
  selected=Math.min(selected,c.boats-1);options.value=selected;showBoat();
@@ -384,26 +639,27 @@ function render(){
  const changes=(proposal?.changes||[]).map(({key,from,to})=>{const f=fields.find(f=>f[0]===key);return `${f?.[1]||key} ${valueLabel(key,from,f?.[2])} → ${valueLabel(key,to,f?.[2])}`;});
  const phase={baseline:'기준 조건 저장',sweep:`한 항목 순차 비교 ${proposal?.sweepIndex}/${proposal?.sweepTotal}`,local:'보관한 해 주변 탐색',restart:'다른 구간 무작위 탐색',random:'전체 범위 무작위',repeat:'동일 조건 · 새 시드'}[proposal?.phase]||'';
  const decision=acceptance?.decision==='accepted'?`개선 채택 · 다음 후보의 출발점 #${acceptance.retainedIteration}`:acceptance?.decision==='retained'?`개선 없음 · 후보는 이력에 기록, 다음 후보는 보관한 #${acceptance.retainedIteration}에서 출발`:acceptance?.decision==='compared'?'비교 기록 · 다음 항목은 기준 #1에서 다시 시작':acceptance?.decision==='sampled'?'새 시드 표본 기록':'기준 저장';
- const trialHeading=`#${result.iteration} · ${phase}${['best','worst'].includes(proposal?.goal)?` · ${proposal.goal==='best'?'최선':'최악'} 방향`:''}`;
+ const trialHeading=`#${result.iteration} · ${phase}`;
  const reference=proposal?.parentRank?`\n비교 기준 #${proposal.parentIteration} · ${rankSummary(proposal.parentRank)}`:'';
- const trialStatus=s.capped?'이벤트 한도 초과 · 최선/최악 선정에서 제외':decision;
+ const trialStatus=!result.rank?'이벤트 한도 초과 · 평가 제외':!result.rank.feasible?'탈락 · 매 1초 전원 수신 조건 미달':decision;
  if (proposal?.phase === 'baseline' && !s.capped) {
-  $('candidate-description').textContent = '기준 설정으로 평가했습니다.';
+  $('candidate-description').textContent = `기준 설정 · ${result.rank?.feasible?'전원 수신 조건 통과':trialStatus}`;
  } else {
   $('candidate-description').textContent=proposal?`${trialHeading}\n${changes.length>2?`${changes.length}개 항목 변경`:changes.join(' / ')||'변경 없음'}\n${trialStatus}`:configSummary(c);
  }
- $('trial-full').textContent=proposal?`${trialHeading}\n\n${changes.join('\n')||'변경 없음'}\n${rankSummary(result.rank)}${reference}\n${trialStatus}\n\n${configSummary(c)}`:configSummary(c);
- const environmentKeys=['boats','spacing','legLength','leewardOffset','layout','collectors','speed','waveHeight','wavePeriod','boatHeight','loss'].filter(k=>keys.has(k));
+ const seconds=s.capped?'':`\n\n${targetLabel(kind)} · 구간별 송신 → 수신 / 평가 대상\n${s.fleet.rounds.map(round=>`${round.second}–${round.second+1}초 · ${round.sent} → ${round.received} / ${s.fleet.target}척`).join('\n')}`;
+ const detail=proposal?`${trialHeading}\n\n${changes.join('\n')||'변경 없음'}\n${rankSummary(result.rank)}${reference}\n${trialStatus}\n\n${configSummary(c)}`:configSummary(c);
+ $('trial-full').textContent=detail+seconds;
+ const environmentKeys=['boats','spacing','legLength','leewardOffset','layout','collectors','speed','waveHeight','wavePeriod','boatHeight','loss','reportTiming'].filter(k=>keys.has(k));
  $('search-guidance').textContent=$('search-mode').value==='repeat'?'설정은 고정하고 시드만 바꿔 결과의 흔들림을 봅니다.':environmentKeys.length?`환경 변수 ${environmentKeys.length}개도 변경 중 · 통신 설정만의 개선과 구분해 해석하세요.`:'배치·이동·파도·시드를 고정하고 선택한 통신 설정을 비교합니다.';
  $('cadence-status').textContent=`계산 ${fmt(evaluationMs)}ms${actualCadence!==null?` · 평균 간격 ${(actualCadence/1000).toFixed(2)}초`:''}`;
  $('environment-caption').textContent=`${labels[c.layout]}${result.scene.windward?' · 가상 대형':''} / 파고 ${c.waveHeight}m · 기준 속도 ${c.speed}kn · 모의 ${c.duration}초`;
- $('compare-results').innerHTML=['lora','ble'].map(k=>`<div class="radio-result" data-kind="${k}"><span>${k==='lora'?'LoRa':'BLE Mesh'}</span><div class="track"><span style="width:${result[k].pdr*100}%"></span></div><strong>${result[k].capped?'제외':pct(result[k].pdr)}</strong></div>`).join('')+`<div class="load-description">LoRa ${result.lora.packetMs.toFixed(2)}ms/패킷 · ${c.channels}ch<br>선택 방식의 채널 부하 ${s.airtime.map(v=>fmt(v*100)+'%').join(' / ')} (중첩 포함)</div>`;
- const causeNames={range:'전파 범위 · 중계 경로 단절',interference:'간섭 · 송수신 겹침',congestion:'송신 큐 초과',mesh:'수신 누락 · 분할 미완료',late:'도착 기한 초과'};
- $('failure-bars').innerHTML=Object.entries(s.failures).filter(([,v])=>v>0).map(([k,v])=>`<div class="failure-line"><span>${causeNames[k]}</span><strong>${fmt(v)}개</strong></div>`).join('')||'<div class="failure-line"><span>관측 구간 내 미도착 없음</span><strong>0개</strong></div>';
- for(const which of ['best','worst']){
-  const record=explorer[which];$(which+'-score').textContent=record?`미갱신 ${record.rank.missing}척`:'—';
-  $(which+'-config').textContent=record?`#${record.iteration} · ${rankSummary(record.rank,false)}\n${configSummary(record.config)}`:'평가 대기';
- }
+ $('compare-results').innerHTML=['lora','ble'].map(k=>`<div class="radio-result" data-kind="${k}"><span>${targetLabel(k)}</span><div class="track"><span style="width:${result[k].pdr*100}%"></span></div><small>${result[k].capped?'—':oneSecond?(fleetPassed(result[k])?'통과':'탈락'):`${fleetScore(result[k])}구간`}</small><strong>${result[k].capped?'제외':pct(result[k].pdr)}</strong></div>`).join('')+`<div class="load-description">LoRa ${result.lora.packetMs.toFixed(2)}ms/패킷 · ${c.channels}ch<br>선택 방식의 채널 부하 ${s.airtime.map(v=>fmt(v*100)+'%').join(' / ')} (중첩 포함)</div>`;
+ const causeNames={unsent:'예정됐으나 송신 없음',range:'전파 범위 · 중계 경로 단절',interference:'간섭 · 송수신 겹침',congestion:'송신·중계 큐 초과',mesh:'수신 누락 · 분할 미완료',late:'기한 초과 수신'};
+ $('failure-bars').innerHTML=s.capped?'<p class="muted">이벤트 한도 초과 · 원인 집계 제외</p>':Object.entries(s.failures).filter(([,v])=>v>0).map(([k,v])=>`<div class="failure-line"><span>${causeNames[k]}</span><strong>${fmt(v)}개</strong></div>`).join('')||'<div class="failure-line"><span>관측 구간 내 미도착 없음</span><strong>0개</strong></div>';
+ const best=explorer.best;
+ $('best-score').textContent=best?'통과':'—';
+ $('best-config').textContent=best?`#${best.iteration} · ${rankSummary(best.rank,false)}\n${configSummary(best.config)}`:'전원 수신 조건을 통과한 회차 없음';
  $('search-status').textContent=`${explorer.done?(keys.size?'순차 완료 · ':'자동 변수 없음 · '):''}${target==='both'?'방식별 불리한 값':target==='ble'?'BLE Mesh':'LoRa'} · ${keys.size}개 변수 · ${explorer.since}회 순위 갱신 없음`;
  drawSea();drawHistory();updateButtons();
 }
@@ -420,7 +676,12 @@ function showBoat(){
   $('boat-detail').textContent=detail;$('boat-detail').title=detail;
   return;
  }
- const b=result[kind].byBoat[selected];
+ const stats=result[kind],b=stats.byBoat[selected];
+ const reception=$('boat-reception');
+ const status=stats.capped?'excluded':!b.scheduled?'not-scheduled':!b.transmitted?'unsent':b.timely?'received':b.received?'late':'missed';
+ const statusNames={excluded:'평가 제외','not-scheduled':'송신 예정 없음',unsent:'미송신',received:'수신',late:'기한 초과',missed:'송신 후 미수신'};
+ reception.dataset.status=status;reception.textContent=statusNames[status];
+ reception.title=stats.capped?'이벤트 한도 초과':`송신 예정 ${b.scheduled}건, 실제 송신 ${b.transmitted}건, 수신 ${b.received}건(정시 ${b.timely}건)`;
  if(displayedPropagation?.result!==result||displayedPropagation?.kind!==kind)displayedPropagation={result,kind,channel:createPropagation(result.config,result.scene,kind)};
  const channel=displayedPropagation.channel;channel.advance(sceneTime);
  const config=result.config, rcId=result.scene.startLine.rcId;
@@ -429,7 +690,8 @@ function showBoat(){
  const bearing=Math.round((relative*180/Math.PI%360+360)%360)%360;
  const loss=antennaLoss(config,pose,rc).toFixed(1);
  const path=b.path.length?b.path.map(i=>i<config.boats?String(i+1):result.scene.nodes[i].label).join(' → '):'전달 경로 없음';
- const detail=`장착 ${pose.mountHeight.toFixed(2)}m · RC 방위 ${bearing}° · 방향 손실 ${loss}dB · RSSI ${channel.power(selected,rcId).toFixed(0)}dBm · 도착 ${b.timely}/${b.sent} · ${path}`;
+ const flow=stats.capped?'':`예정 ${b.scheduled} · 송신 ${b.transmitted} · 수신 ${b.received}${b.received>b.timely?`(정시 ${b.timely})`:''}건 · `;
+ const detail=`${flow}장착 ${pose.mountHeight.toFixed(2)}m · RC 방위 ${bearing}° · 방향 손실 ${loss}dB · RSSI ${channel.power(selected,rcId).toFixed(0)}dBm · ${path}`;
  $('boat-detail').textContent=detail;
  $('boat-detail').title=`${detail} · 유효 수직 높이 ${pose.height.toFixed(2)}m · ${(pose.speed/.514444).toFixed(1)}kn · 기울기 ${(pose.roll*180/Math.PI).toFixed(0)}° · 상대방위 0°는 선수`;
 }
@@ -446,7 +708,7 @@ function drawSea(){
  const end=courseReplay?.duration ?? c.duration;
  sceneTime=Math.min(sceneTime,end);
  $('scene-time').max=end;$('scene-time').value=sceneTime;
- $('scene-clock').textContent=courseReplay?`${courseClock(sceneTime)} / ${courseClock(end)}`:`${sceneTime.toFixed(1)} / ${end.toFixed(1)}초`;
+ $('scene-clock').textContent=courseReplay?`${courseClock(sceneTime)} / ${courseClock(end)}`:`지도 ${sceneTime.toFixed(1)} / ${end.toFixed(1)}초`;
  const {startLine:{pin,rcId},windward,leeward}=scene;
  const nodes=scene.nodes.map(node=>courseReplay?coursePose(node):nodeState(c,node,sceneTime));
  const rc=nodes[rcId];
@@ -475,7 +737,7 @@ function drawSea(){
   ctx.beginPath();ctx.moveTo(X(leeward.x),Y(leeward.y));ctx.lineTo(X(windward.x),Y(windward.y));ctx.stroke();
   ctx.setLineDash([]);ctx.globalAlpha=1;
  }
- if(!courseReplay && $('show-links').checked){
+ if(!courseReplay && !stats.capped && $('show-links').checked){
   const successfulPaths=new Map();
   for(const b of stats.byBoat){for(let i=1;i<b.path.length;i++){const a=b.path[i-1],z=b.path[i];successfulPaths.set(`${a}-${z}`,[a,z]);}}
   ctx.strokeStyle=color('--blue');ctx.lineWidth=.8;ctx.globalAlpha=.18;
@@ -504,8 +766,9 @@ function drawSea(){
   const x=X(node.x),y=Y(node.y);hitPoints.push({id:node.id,x,y});
   if(node.id===rcId)continue;
   if(node.collector){ctx.fillStyle=color('--blue');ctx.fillRect(x-5,y-5,10,10);ctx.fillStyle=color('--text');ctx.textAlign='left';ctx.fillText(node.label,x+10,y+4);continue;}
-  const b=stats.byBoat[node.id],p=b.timely/b.sent;
-  const fill=color(courseReplay?gateColor(node.gateSide):p>=.9?'--best':p>0?'--partial':'--worst');
+  const b=stats.byBoat[node.id],p=b.transmitted?b.timely/b.transmitted:0;
+  const missed=!courseReplay&&!stats.capped&&b.transmitted>0&&b.timely===0;
+  const fill=color(courseReplay?gateColor(node.gateSide):stats.capped||!b.transmitted?'--muted':p>=.9?'--best':p>0?'--partial':'--worst');
   if(!courseReplay && c.speed>0 && sceneTime>0){
    const initial=scene.nodes[node.id];
    ctx.strokeStyle=fill;ctx.globalAlpha=.55;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(X(initial.x),Y(initial.y));
@@ -513,7 +776,11 @@ function drawSea(){
    ctx.lineTo(x,y);ctx.stroke();ctx.globalAlpha=1;
   }
   if(!courseReplay && kind==='ble' && node.relay){ctx.strokeStyle=fill;ctx.globalAlpha=.65;ctx.lineWidth=1;ctx.beginPath();ctx.arc(x,y,8,0,Math.PI*2);ctx.stroke();ctx.globalAlpha=1;}
-  ctx.save();ctx.translate(x,y);ctx.rotate(node.heading);ctx.scale(Math.max(.35,Math.cos(node.roll)),1);ctx.fillStyle=fill;ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(3.7,4);ctx.lineTo(0,2.5);ctx.lineTo(-3.7,4);ctx.closePath();ctx.fill();ctx.restore();
+  ctx.save();ctx.translate(x,y);ctx.rotate(node.heading);ctx.scale(Math.max(.35,Math.cos(node.roll)),1);
+  ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(3.7,4);ctx.lineTo(0,2.5);ctx.lineTo(-3.7,4);ctx.closePath();
+  if(missed){ctx.strokeStyle=fill;ctx.lineWidth=1.45;ctx.stroke();}
+  else{ctx.fillStyle=fill;ctx.fill();}
+  ctx.restore();
   if(node.id===selected){ctx.strokeStyle=color('--text');ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(x,y,11,0,Math.PI*2);ctx.stroke();ctx.textAlign='left';ctx.fillStyle=color('--text');ctx.fillText(`배 ${node.id+1}`,x+14,y-8);}
   else if(c.boats<=30){ctx.fillStyle=color('--muted');ctx.textAlign='left';ctx.fillText(String(node.id+1),x+8,y+4);}
  }
@@ -523,8 +790,10 @@ function drawSea(){
  ctx.strokeStyle=color('--muted');ctx.lineWidth=1;ctx.beginPath();
  ctx.moveTo(scaleLeft,scaleY-4);ctx.lineTo(scaleLeft,scaleY);ctx.lineTo(scaleRight,scaleY);ctx.lineTo(scaleRight,scaleY-4);ctx.stroke();
  ctx.fillStyle=color('--muted');ctx.textAlign='center';ctx.fillText(`${fmt(bar)} m`,(scaleLeft+scaleRight)/2,scaleY-8);
+ const outcome=stats.capped?'이벤트 한도 초과로 수신 평가 제외.'
+  :`기한 내 수신 ${stats.scheduledBoats-stats.missingTimely}척, 송신 후 기한 내 도착 0건 ${stats.missingTimely-stats.unsentBoats}척, 미송신 ${stats.unsentBoats}척. 예정 ${stats.generated}건 중 실제 송신 ${stats.transmitted}건.`;
  const mapDescription=courseReplay?`${$('course-case').textContent} 코스 재생. 경기정 ${c.boats}척.`
-  :`${labels[c.layout]}, ${kind==='ble'?'BLE Mesh':'LoRa'} ${c.boats}척. 기한 내 도착률 ${pct(stats.pdr)}, 기한 내 미갱신 ${stats.missingTimely}척.`;
+  :`${$('map-case').textContent}. ${labels[c.layout]}, ${kind==='ble'?'BLE Mesh':'LoRa'}. ${outcome}`;
  const marksDescription=showGate?` G3 풍하 게이트는 스타트 라인 기준 ${valueLabel('leewardOffset',leeward.y)}. 왼쪽 3S와 오른쪽 3P 사이로 진입합니다.`:'';
  $('sea').setAttribute('aria-label',`${mapDescription} 스타트 라인 왼쪽은 핀마크, 오른쪽은 수신 전용 RC 보트.${showWindward?' 풍상 마크 M1.':''}${marksDescription}`);
 }
@@ -687,13 +956,16 @@ function drawHistoryChart(canvas,list){
   return;
  }
  const low=list[0].iteration,high=Math.max(low+1,list.at(-1).iteration),X=i=>left+(i-low)/(high-low)*(right-left),Y=v=>bottom-v*(bottom-top);
- for(const [key,tone]of [['best','--best'],['worst','--worst']]){ctx.strokeStyle=color(tone);ctx.lineWidth=1.5;ctx.beginPath();let begun=false;for(const r of list){if(r[key]===null)continue;begun?ctx.lineTo(X(r.iteration),Y(r[key])):ctx.moveTo(X(r.iteration),Y(r[key]));begun=true;}ctx.stroke();}
+ ctx.strokeStyle=color('--best');ctx.lineWidth=1.5;ctx.beginPath();let begun=false;
+ for(const r of list){if(r.best===null)continue;begun?ctx.lineTo(X(r.iteration),Y(r.best)):ctx.moveTo(X(r.iteration),Y(r.best));begun=true;}
+ ctx.stroke();
  const points=[];
- ctx.fillStyle=color('--blue');for(const r of list){if(r.score===null)continue;const p={x:X(r.iteration),y:Y(r.score),record:r};points.push(p);ctx.beginPath();ctx.arc(p.x,p.y,2.5,0,Math.PI*2);ctx.fill();}
+ ctx.fillStyle=color('--blue');ctx.strokeStyle=color('--worst');ctx.lineWidth=1.25;
+ for(const r of list){if(r.score===null)continue;const p={x:X(r.iteration),y:Y(r.score),record:r};points.push(p);ctx.beginPath();ctx.arc(p.x,p.y,2.5,0,Math.PI*2);if(r.rank.feasible)ctx.fill();else ctx.stroke();}
  if(!points.length){
   ctx.fillStyle=color('--muted');ctx.textAlign='center';ctx.fillText('표시할 도착률 없음',(left+right)/2,(top+bottom)/2-7);
  }
- const selectedPoint=view==='replay' && points.find(p=>p.record.iteration===replay?.iteration);
+ const selectedPoint=view==='replay' && !replay?.snapshot && points.find(p=>p.record.iteration===replay?.iteration);
  if(selectedPoint){
   ctx.strokeStyle=color('--text');ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(selectedPoint.x,selectedPoint.y,5,0,Math.PI*2);ctx.stroke();
  }
@@ -701,15 +973,24 @@ function drawHistoryChart(canvas,list){
  ctx.fillStyle=color('--muted');ctx.textAlign='left';ctx.fillText(`#${low}`,left,h-6);
  if(list.length>1){ctx.textAlign='right';ctx.fillText(`#${list.at(-1).iteration} 평가`,right,h-6);}
 }
-async function replayHistoryPoint(event){
+function replayHistoryPoint(event){
  const canvas=event.currentTarget,points=historyPoints.get(canvas);
  if(busy || !points?.length)return;
  const x=event.clientX-canvas.getBoundingClientRect().left;
  const picked=points.reduce((a,b)=>Math.abs(a.x-x)<Math.abs(b.x-x)?a:b).record;
+ replayCase(picked);
+}
+async function replayCase(picked,fromSnapshot=false){
  stop();busy=true;updateButtons();const token=generation;
- try{const data=await request(picked.config);if(token!==generation)return;replay={...data.result,rank:picked.rank,iteration:picked.iteration,proposal:picked.proposal,acceptance:picked.acceptance};
- if(!$('case-view').querySelector('option[value="replay"]'))$('case-view').add(new Option('이력 다시 보기','replay'));
- view='replay';$('case-view').value=view;if(narrowLayout.matches)selectTab('map');render();}catch(error){showError(error.message);}finally{busy=false;updateButtons();if(needBaseline)stepSearch();}
+ try{const data=await request(picked.config);if(token!==generation)return;replay={...data.result,rank:fromSnapshot?rankResult(data.result,picked.target):picked.rank,iteration:picked.iteration,proposal:picked.proposal,acceptance:picked.acceptance,snapshot:fromSnapshot?picked:null};
+ const select=$('case-view');const label=fromSnapshot?'스냅샷 다시 보기':'이력 다시 보기';
+ const option=select.querySelector('option[value="replay"]');
+ if(option)option.textContent=label;else select.add(new Option(label,'replay'));
+ view='replay';select.value=view;
+ if(narrowLayout.matches)selectTab('map');
+ if(fromSnapshot&&picked.target!=='both')switchKind(picked.target);
+ else render();
+ }catch(error){showError(error.message);}finally{busy=false;updateButtons();if(needBaseline)stepSearch();}
 }
 for(const canvas of historyCanvases)canvas.addEventListener('click',replayHistoryPoint);
 $('open-history').onclick=()=>{$('tab-history').click();$('tab-history').focus();};
@@ -719,23 +1000,42 @@ $('validate').onclick=async()=>{
  if(values.length){const range=(key,f)=>`${f(Math.min(...values.map(v=>v[key])))}–${f(Math.max(...values.map(v=>v[key])))}`;$('validation-result').textContent=`조건 #${result.iteration} · 다른 ${values.length}개 시드 · 미갱신 ${range('missing',String)}척 · 공백 ${range('gap',v=>v.toFixed(2))}초 · 도착률 ${range('pdr',pct)}`;}else $('validation-result').textContent=`조건 #${result.iteration} 계산 한도 초과 · 검증 결과 없음`;
  }catch(error){showError(error.message);}finally{busy=validating=false;updateButtons();if(needBaseline)stepSearch();}
 };
-$('export').onclick=()=>{
+$('export').onclick=async()=>{
  const summary = record => record ? {config:record.config,score:record.score,rank:record.rank,iteration:record.iteration} : null;
- const data={modelVersion:MODEL_VERSION,createdAt:new Date().toISOString(),base,keys:[...keys],searchLimits,target,mode:$('search-mode').value,strategy:$('strategy').value,paceMs:Number($('pace').value),current:displayResult()?.config,best:summary(explorer.best),worst:summary(explorer.worst),records};
- const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`radio-search-${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);
+ const data={modelVersion:MODEL_VERSION,createdAt:new Date().toISOString(),base,keys:[...keys],searchLimits,target,mode:$('search-mode').value,strategy:$('strategy').value,paceMs:Number($('pace').value),current:displayResult()?.config,best:summary(explorer.best),records};
+ const filename=`radio-search-${Date.now()}.json`,contents=JSON.stringify(data,null,2);
+ if(desktopInvoke){
+  try{await desktopInvoke('save_record',{filename,contents});}
+  catch(error){showError(error.message ?? String(error));}
+  return;
+ }
+ const blob=new Blob([contents],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),2000);
 };
-$('import').onclick=()=>$('import-file').click();
-$('import-file').onchange=async()=>{
- const file=$('import-file').files[0];if(!file)return;
- try{if(file.size>5e6)throw new Error('5MB 이하 기록을 선택해 주세요.');const data=JSON.parse(await file.text());
- if(!['0.1.0','0.2.0','0.3.0','0.4.0','0.5.0','0.6.0','0.7.0','0.8.0','0.8.1',MODEL_VERSION].includes(data.modelVersion) || !data.current && !data.base)throw new Error('지원하는 모델 버전의 탐색 기록이 아닙니다.');
- base=normalize({antennaShadow:0,boatHeight:1.2,boatHeightSpread:0,...(data.current||data.base)});keys=new Set((data.keys||defaultKeys).filter(k=>Object.hasOwn(SPACE,k)));searchLimits=normalizeSearchLimits(data.searchLimits);target=['both','lora','ble'].includes(data.target)?data.target:'both';$('objective').value=target;
- $('strategy').value=['hybrid','sequential','local','random'].includes(data.strategy)?data.strategy:'random';$('search-mode').value=['both','best','worst','repeat'].includes(data.mode)?data.mode:'both';
+function importRecord(contents){
+ const data=JSON.parse(contents);
+ if(!['0.1.0','0.2.0','0.3.0','0.4.0','0.5.0','0.6.0','0.7.0','0.8.0','0.8.1','0.9.0','0.9.2',MODEL_VERSION].includes(data?.modelVersion) || !data.current && !data.base)throw new Error('지원하는 모델 버전의 탐색 기록이 아닙니다.');
+ const loadedKeys=Array.isArray(data.keys)?data.keys:defaultKeys;
+ base=normalize({antennaShadow:0,boatHeight:1.2,boatHeightSpread:0,...(data.current||data.base),duration:1,deadline:1});keys=new Set(loadedKeys.filter(k=>configurableKeys.has(k)));searchLimits=normalizeSearchLimits(data.searchLimits);target=['both','lora','ble'].includes(data.target)?data.target:'both';$('objective').value=target;
+ $('strategy').value=['hybrid','sequential','local','random'].includes(data.strategy)?data.strategy:'random';$('search-mode').value=data.mode==='repeat'?'repeat':'best';
  if([100,200,500,1000,2000,5000].includes(data.paceMs))$('pace').value=data.paceMs;
  for(const key of Object.keys(SPACE))if($('auto-'+key))$('auto-'+key).checked=keys.has(key);
  resetSearch();$('validation-result').textContent='저장한 조건을 불러왔습니다. 새 탐색으로 재평가합니다.';
+}
+$('import').onclick=async()=>{
+ if(!desktopInvoke){$('import-file').click();return;}
+ try{
+  const contents=await desktopInvoke('open_record');
+  if(contents!==null)importRecord(contents);
+ }catch(error){showError(error.message ?? String(error));}
+};
+$('import-file').onchange=async()=>{
+ const file=$('import-file').files[0];if(!file)return;
+ try{
+  if(file.size>5e6)throw new Error('5MB 이하 기록을 선택해 주세요.');
+  importRecord(await file.text());
  }catch(error){showError(error.message);}finally{$('import-file').value='';}
 };
-const observer=new ResizeObserver(()=>{drawSea();drawHistory();});observer.observe($('sea'));
+const observer=new ResizeObserver(()=>{if(!fastSession){drawSea();drawHistory();}});observer.observe($('sea'));
 for(const canvas of historyCanvases)observer.observe(canvas);
 resetSearch();
+loadValidationSnapshot();

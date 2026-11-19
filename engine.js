@@ -2,12 +2,12 @@ import { ILCA_LAYOUTS, ILCA_LEEWARD_OFFSET, ilcaCourse, ilcaBoats } from './ilca
 
 // Screening model, not a calibrated RF or Bluetooth conformance simulator.
 // All time values are seconds, positions metres, power dBm unless noted.
-export const MODEL_VERSION = '0.9.0';
+export const MODEL_VERSION = '0.9.3';
 export const ENVIRONMENT_STEP = 0.1;
 export const DEFAULTS = Object.freeze({
   boats: 100, spacing: 70, layout: 'ilcaBeat', legLength: 1100, leewardOffset: ILCA_LEEWARD_OFFSET, collectors: 1,
   speed: 0, waveHeight: 0, wavePeriod: 4,
-  hz: 1, payload: 24, duration: 8, deadline: 1, seed: 20261119,
+  hz: 1, reportTiming: 'default', payload: 24, duration: 1, deadline: 1, seed: 20261119,
   power: 8, boatHeight: 0.8, boatHeightSpread: 0.2, receiverHeight: 3, fade: 3, loss: 3,
   antennaShadow: 4, shadowSide: 'stern',
   sf: 7, bw: 500, cr: 5, channels: 2, mac: 'tdma', jitter: 0.3,
@@ -26,8 +26,8 @@ export const SPACE = Object.freeze({
   shadowSide: ['bow', 'starboard', 'stern', 'port'],
   fade: [0, 10, 1], bleSensitivity: [-110, -85, 1],
   channelSpacing: [0.125, 2, 0.125], adjacent: [0, 80, 5], capture: [0, 20, 1], queueMs: [20, 2000, 20],
-  duration: [8, 15, 30],
-  hz: [0.5, 1, 2, 5], payload: [8, 16, 24, 32, 48],
+  duration: [1, 8, 15, 30],
+  hz: [0.5, 1, 2, 5], reportTiming: ['default', 'grouped', 'synchronized'], payload: [8, 16, 24, 32, 48],
   sf: [7, 8, 9, 10, 11, 12], bw: [125, 250, 500], cr: [5, 6, 7, 8],
   channels: [1, 2, 3, 4], mac: ['tdma', 'aloha'], jitter: [0, 0.3, 1, 3, 10],
   relays: [0, 60, 5], ttl: [0, 2, 3, 4, 5], repeats: [1, 2, 3],
@@ -46,7 +46,7 @@ function noise(r) { return Math.sqrt(-2 * Math.log(Math.max(1e-9, r()))) * Math.
 export function normalize(input = {}) {
   const c = { ...DEFAULTS, ...input };
   for (const key of Object.keys(SPACE)) {
-    if (key === 'duration') continue; // Public engine also supports custom durations in 2–30 s.
+    if (key === 'duration') continue; // Public engine also supports custom durations in 1–30 s.
     const v = SPACE[key];
     if (RANGED.has(key)) {
       const number = Number(c[key]);
@@ -55,7 +55,7 @@ export function normalize(input = {}) {
     else if (!v.includes(c[key])) c[key] = DEFAULTS[key];
   }
   c.boats = Math.round(c.boats); c.collectors = Math.round(c.collectors);
-  c.duration = clamp(Number(c.duration) || 8, 2, 30);
+  c.duration = clamp(Number(c.duration) || DEFAULTS.duration, 1, 30);
   c.deadline = clamp(Number(c.deadline) || 1, 0.1, 5);
   c.seed = Number(c.seed) >>> 0;
   return c;
@@ -236,6 +236,13 @@ export function createPropagation(c, scene, kind) {
   }
   advance(0);
   return { advance, power, linear(i, j) { power(i, j); return i === j ? 1e10 : mw[i * n + j]; },
+    reset() {
+      updates = 1;
+      if (frame !== 0) {
+        updates = 0;
+        advance(0);
+      }
+    },
     get frame() { return frame; }, get updates() { return updates; }, dynamic };
 }
 class Heap {
@@ -250,10 +257,61 @@ class Heap {
   get length() { return this.a.length; }
 }
 function percentile(a, p) { if (!a.length) return null; a.sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor((a.length - 1) * p))]; }
-export function simulate(input, kind = 'lora', customScene = null) {
+export const createFailureCounts = () => ({ unsent: 0, overtime: 0, collision: 0, weak: 0, unplanned: 0, other: 0 });
+const failurePriority = { unsent: 0, other: 1, weak: 2, collision: 3, overtime: 4 };
+
+function fleetDiagnostics(c, kind, rounds, messages, active, nodes, segmentCount) {
+  const crossing = new Map();
+  for (const tx of active) {
+    if (tx.end <= c.duration || tx.m.delivered !== null) continue;
+    const canComplete = tx.receivers.some(({ rx, failed }) => {
+      const got = tx.m.got.get(rx);
+      return nodes[rx].collector && !failed && (got?.size ?? 0) === segmentCount - 1 && !got?.has(tx.seg);
+    });
+    if (canComplete && (!crossing.has(tx.m.id) || tx.end < crossing.get(tx.m.id).end)) crossing.set(tx.m.id, tx);
+  }
+
+  const attempts = rounds.map(() => new Map());
+  for (const m of messages) {
+    const second = Math.floor(m.generated + 1e-8), round = rounds[second];
+    if (!round || round.received.has(m.source)) continue;
+    const deadline = Math.min(second + 1, m.generated + c.deadline);
+    const tx = crossing.get(m.id);
+    let cause = 'other';
+    if (!round.sent.has(m.source) || m.transmittedAt === null || m.transmittedAt >= second + 1) cause = 'unsent';
+    else if (m.delivered > deadline || tx?.end > deadline) cause = 'overtime';
+    else if (m.reachableAtStart === false) cause = 'weak';
+    else if (m.cause.collision || m.cause.halfDuplex) cause = 'collision';
+    else if (kind === 'lora' && m.cause.weak && !m.cause.queue) cause = 'weak';
+
+    const previous = attempts[second].get(m.source);
+    if (!previous || failurePriority[cause] > failurePriority[previous.cause]) {
+      attempts[second].set(m.source, {
+        boat: m.source + 1, second, cause, requestedAt: m.generated,
+        transmittedAt: tx?.t ?? m.transmittedAt, endsAt: m.delivered ?? tx?.end ?? null
+      });
+    }
+  }
+
+  const counts = createFailureCounts();
+  let example = null;
+  for (const [second, round] of rounds.entries()) {
+    for (let source = 0; source < c.boats; source++) {
+      if (round.received.has(source)) continue;
+      const attempt = attempts[second].get(source) ?? { boat: source + 1, second, cause: 'unplanned' };
+      counts[attempt.cause]++;
+      if (!example || attempt.cause === 'overtime' && example.cause !== 'overtime') example = attempt;
+    }
+  }
+  return { counts, example };
+}
+
+export function simulate(input, kind = 'lora', customScene = null, diagnose = false, cachedPropagation = null) {
   const c = normalize(input), scene = customScene || makeScene(c), nodes = scene.nodes, count = nodes.length;
   const r = rng(c.seed ^ (kind === 'lora' ? 0x5678ABCD : 0x1234CDEF));
-  const propagation = createPropagation(c, scene, kind), power = propagation.power, linear = propagation.linear;
+  const propagation = cachedPropagation ?? createPropagation(c, scene, kind);
+  if (cachedPropagation) propagation.reset();
+  const { power, linear } = propagation;
   const sens = sensitivity(c, kind), threshold = 10 ** (c.capture / 10), heap = new Heap(), active = new Set();
   const messages = [], next = new Float64Array(count), radioUntil = new Float64Array(count), airtimeByChannel = new Float64Array(kind === 'ble' ? 3 : c.channels);
   const txByNode = new Uint32Array(count), cache = Array.from({ length: count }, () => new Set());
@@ -279,14 +337,21 @@ export function simulate(input, kind = 'lora', customScene = null) {
     return minHops;
   }
   const segments = kind === 'ble' ? bleSegments(c.payload) : [{ airtime: loraAirtime(c) }];
-  const period = 1 / c.hz, until = c.duration + c.deadline;
+  const period = 1 / c.hz, until = c.duration === 1 ? 1 : c.duration + c.deadline;
+  const tdma = kind === 'lora' && c.mac === 'tdma';
   if (propagation.dynamic) for (let frame = 1; frame * ENVIRONMENT_STEP <= until; frame++) heap.push({ t: frame * ENVIRONMENT_STEP, type: 0.5 });
   for (let source = 0; source < c.boats; source++) {
     const channel = source % c.channels, slot = Math.floor(source / c.channels), slots = Math.ceil(c.boats / c.channels);
-    // Report generation happens at the assigned slot in TDMA; unslotted clocks have independent phases.
-    const phase = kind === 'lora' && c.mac === 'tdma' ? slot * period / slots : r() * period;
+    const slotPhase = slot * period / slots;
+    const defaultPhase = tdma ? slotPhase : r() * period;
+    let phase = defaultPhase;
+    if (c.reportTiming === 'synchronized') phase = 0;
+    if (c.reportTiming === 'grouped') phase = Math.floor(source * 4 / c.boats) * period / 4;
     for (let t = phase; t < c.duration - 1e-8; t += period) {
-      const m = { id: messages.length, source, generated: t, delivered: null, hops: null, path: [], got: new Map(), attempts: 0, cause: { weak: 0, collision: 0, halfDuplex: 0, queue: 0 }, channel };
+      // A report can become due before its TDMA slot. The deadline includes that wait.
+      const slotTime = tdma && c.reportTiming !== 'default'
+        ? slotPhase + Math.max(0, Math.ceil((t - slotPhase - 1e-8) / period)) * period : t;
+      const m = { id: messages.length, source, generated: t, slotTime, transmittedAt: null, delivered: null, hops: null, path: [], got: new Map(), attempts: 0, cause: { weak: 0, collision: 0, halfDuplex: 0, queue: 0 }, channel };
       messages.push(m); heap.push({ t, type: 2, m });
     }
   }
@@ -301,13 +366,18 @@ export function simulate(input, kind = 'lora', customScene = null) {
     for (let rep = 0; rep < c.repeats; rep++) scheduleBle(node, m, seg, hops, path, earliest + rep * 0.02 + r() * 0.01);
   }
   function mark(f, cause) { if (!f.failed) { f.failed = cause; stats[cause]++; f.m.cause[cause]++; } }
+  const adjacentLeakage = 10 ** (-c.adjacent / 10);
   function leakage(ch1, ch2) {
     if (ch1 === ch2) return 1;
     if (kind === 'ble') return 0;
-    return Math.abs(ch1 - ch2) * c.channelSpacing * 1000 < c.bw ? 1 : 10 ** (-c.adjacent / 10);
+    return Math.abs(ch1 - ch2) * c.channelSpacing * 1000 < c.bw ? 1 : adjacentLeakage;
   }
   function startTx(e) {
     if (e.t > until) return;
+    if (e.node === e.m.source && e.m.transmittedAt === null) {
+      e.m.transmittedAt = e.t;
+      e.m.reachableAtStart = Number.isFinite(topology()[e.m.source]);
+    }
     const tx = { ...e, end: e.t + e.duration, receivers: [] };
     stats.radioTx++; txByNode[e.node]++; airtimeByChannel[e.channel] += e.duration;
     const from = kind === 'ble' ? 0 : c.boats;
@@ -320,7 +390,10 @@ export function simulate(input, kind = 'lora', customScene = null) {
         if (Math.floor(a / 0.01) !== Math.floor(b / 0.01) || Math.floor(a / 0.01) % 3 !== e.channel || a % 0.01 > 0.01 * c.scan / 100 || b % 0.01 > 0.01 * c.scan / 100) continue;
       }
       const f = { rx, signal: linear(e.node, rx), interference: 0, failed: null, m: e.m };
-      for (const other of active) f.interference += linear(other.node, rx) * leakage(e.channel, other.channel);
+      for (const other of active) {
+        const factor = leakage(e.channel, other.channel);
+        if (factor) f.interference += linear(other.node, rx) * factor;
+      }
       if (f.interference > 0 && f.signal / f.interference < threshold) mark(f, 'collision');
       tx.receivers.push(f);
     }
@@ -328,6 +401,7 @@ export function simulate(input, kind = 'lora', customScene = null) {
       const factor = leakage(other.channel, e.channel);
       for (const f of other.receivers) {
         if (kind === 'ble' && f.rx === e.node) { mark(f, 'halfDuplex'); continue; }
+        if (!factor) continue;
         f.interference += linear(e.node, f.rx) * factor;
         if (f.interference > 0 && f.signal / f.interference < threshold) mark(f, 'collision');
       }
@@ -336,7 +410,11 @@ export function simulate(input, kind = 'lora', customScene = null) {
   }
   function finishTx(tx, t) {
     active.delete(tx);
-    for (const other of active) for (const f of other.receivers) f.interference = Math.max(0, f.interference - linear(tx.node, f.rx) * leakage(other.channel, tx.channel));
+    for (const other of active) {
+      const factor = leakage(other.channel, tx.channel);
+      if (!factor) continue;
+      for (const f of other.receivers) f.interference = Math.max(0, f.interference - linear(tx.node, f.rx) * factor);
+    }
     for (const f of tx.receivers) {
       if (f.failed) continue;
       const m = tx.m, rx = f.rx, path = [...tx.path, rx];
@@ -363,18 +441,22 @@ export function simulate(input, kind = 'lora', customScene = null) {
       // Recheck in-flight packets too: long LoRa packets can cross several wave snapshots.
       for (const tx of active) for (const f of tx.receivers) {
         f.signal = linear(tx.node, f.rx); f.interference = 0;
-        for (const other of active) if (other !== tx) f.interference += linear(other.node, f.rx) * leakage(tx.channel, other.channel);
+        for (const other of active) {
+          if (other === tx) continue;
+          const factor = leakage(tx.channel, other.channel);
+          if (factor) f.interference += linear(other.node, f.rx) * factor;
+        }
         if (power(tx.node, f.rx) < sens) mark(f, 'weak');
         else if (f.interference > 0 && f.signal / f.interference < threshold) mark(f, 'collision');
       }
     }
     else if (e.type === 1) startTx(e);
     else if (e.type === 2) {
-      e.m.reachableAtStart = Number.isFinite(topology()[e.m.source]);
       if (kind === 'lora') {
         const duration = segments[0].airtime;
-        const start = Math.max(e.t + Math.abs(noise(r)) * c.jitter / 1000, next[e.m.source]);
-        if (start - e.t > c.queueMs / 1000) { stats.queue++; e.m.cause.queue++; continue; }
+        const slotTime = e.m.slotTime;
+        const start = Math.max(slotTime + Math.abs(noise(r)) * c.jitter / 1000, next[e.m.source]);
+        if (start - slotTime > c.queueMs / 1000) { stats.queue++; e.m.cause.queue++; continue; }
         next[e.m.source] = start + duration;
         heap.push({ t: start, type: 1, node: e.m.source, m: e.m, seg: 0, hops: 1, path: [e.m.source], duration, channel: e.m.channel });
       } else {
@@ -386,24 +468,44 @@ export function simulate(input, kind = 'lora', customScene = null) {
       for (let ch = 0; ch < 3; ch++) heap.push({ ...e, t: e.t + ch * (e.duration + 0.00015), type: 1, channel: ch });
     }
   }
-  const byBoat = Array.from({ length: c.boats }, (_, id) => ({ id, sent: 0, received: 0, timely: 0, path: [], hops: null, gap: 0, last: 0, reachable: !!everReachable[id], rssi: Math.max(...nodes.slice(c.boats).map(q => power(id, q.id))) }));
-  const delays = [], hops = [], failures = { range: 0, interference: 0, congestion: 0, mesh: 0, late: 0 };
-  let delivered = 0, timely = 0;
+  const byBoat = Array.from({ length: c.boats }, (_, id) => ({
+    id, scheduled: 0, transmitted: 0, received: 0, timely: 0, firstScheduled: null, path: [], hops: null,
+    gap: 0, last: 0, reachable: !!everReachable[id], rssi: Math.max(...nodes.slice(c.boats).map(q => power(id, q.id)))
+  }));
+  const delays = [], hops = [], failures = { unsent: 0, range: 0, interference: 0, congestion: 0, mesh: 0, late: 0 };
+  const rounds = Array.from({ length: Math.floor(c.duration) }, () => ({ sent: new Set(), received: new Set() }));
+  let transmitted = 0, delivered = 0, timely = 0;
   for (const m of messages) {
-    const b = byBoat[m.source]; b.sent++;
+    const b = byBoat[m.source]; b.scheduled++;
+    b.firstScheduled ??= m.generated;
+    if (m.transmittedAt === null) {
+      failures.unsent++;
+      continue;
+    }
+    transmitted++; b.transmitted++;
+    // Each reporting round is a fixed one-second interval from evaluation start.
+    // A packet carried over from another round cannot satisfy this round's update.
+    const second = Math.floor(m.generated + 1e-8), round = rounds[second];
+    const withinRound = round && m.transmittedAt < second + 1;
+    if (withinRound) round.sent.add(m.source);
     if (m.delivered !== null) {
       delivered++; b.received++; const delay = m.delivered - m.generated; delays.push(delay); hops.push(m.hops);
       b.path = m.path; b.hops = m.hops;
-      if (delay <= c.deadline) { timely++; b.timely++; } else failures.late++;
+      if (delay <= c.deadline) {
+        timely++; b.timely++;
+        if (withinRound && m.delivered <= second + 1) round.received.add(m.source);
+      } else failures.late++;
     } else if (m.reachableAtStart === false || m.cause.weak && !m.cause.collision && !m.cause.halfDuplex && !m.cause.queue) failures.range++;
     else if (m.cause.queue) failures.congestion++;
     else if (m.cause.collision || m.cause.halfDuplex) failures.interference++;
     else if (kind === 'lora') failures.range++;
     else failures.mesh++;
   }
-  // Silence is measured from t=0 and includes boats that never reported. Not an AoI estimate.
+  // Start measuring silence when each boat's first report is due.
   const arrivals = messages.filter(m => m.delivered !== null && m.delivered <= c.duration).sort((a, b) => a.delivered - b.delivered);
+  const eligible = byBoat.filter(b => b.scheduled > 0);
   const lastTimely = new Float64Array(c.boats), timelyGaps = new Float64Array(c.boats);
+  for (const b of eligible) b.last = lastTimely[b.id] = b.firstScheduled;
   for (const m of arrivals) {
     const b = byBoat[m.source];
     b.gap = Math.max(b.gap, m.delivered - b.last); b.last = m.delivered;
@@ -413,24 +515,82 @@ export function simulate(input, kind = 'lora', customScene = null) {
     }
   }
   byBoat.forEach(b => {
-    b.gap = Math.max(b.gap, c.duration - b.last);
-    b.timelyGap = Math.max(timelyGaps[b.id], c.duration - lastTimely[b.id]);
+    b.gap = b.scheduled ? Math.max(b.gap, c.duration - b.last) : 0;
+    b.timelyGap = b.scheduled ? Math.max(timelyGaps[b.id], c.duration - lastTimely[b.id]) : 0;
+    b.sent = b.scheduled; // Legacy reporting field counted generated reports.
   });
-  const disconnected = byBoat.filter(b => b.received === 0).length;
-  return { kind, capped, generated: messages.length, delivered, timely, pdr: timely / messages.length,
+  const disconnected = eligible.filter(b => b.received === 0).length;
+  const fleetRounds = rounds.map((round, second) => ({ second, sent: round.sent.size, received: round.received.size }));
+  const fleet = {
+    target: c.boats,
+    complete: fleetRounds.filter(round => round.received === c.boats).length,
+    rounds: fleetRounds
+  };
+  const diagnostics = diagnose && !capped && fleet.complete < rounds.length
+    ? fleetDiagnostics(c, kind, rounds, messages, active, nodes, segments.length) : null;
+  return { kind, capped, generated: messages.length, transmitted, delivered, timely, pdr: timely / messages.length,
     eventual: delivered / messages.length, latency95: percentile(delays, 0.95), meanHops: hops.length ? hops.reduce((a, b) => a + b, 0) / hops.length : null,
     longestGap: Math.max(...byBoat.map(b => b.gap)), disconnected,
-    missingTimely: byBoat.filter(b => b.timely === 0).length,
+    scheduledBoats: eligible.length, unsentBoats: eligible.filter(b => b.transmitted === 0).length,
+    missingTimely: eligible.filter(b => b.timely === 0).length,
     longestTimelyGap: Math.max(...byBoat.map(b => b.timelyGap)),
     airtime: Array.from(airtimeByChannel, a => a / c.duration), txByNode: Array.from(txByNode),
-    byBoat, failures, stats, packetMs: segments[0].airtime * 1000, segments: segments.length,
+    byBoat, failures, fleet, stats, packetMs: segments[0].airtime * 1000, segments: segments.length,
     trace: messages.filter(m => m.delivered !== null).slice(-80).map(m => ({ time: m.delivered, path: m.path, source: m.source, delay: m.delivered - m.generated })),
-    sensitivity: sens, environmentFrames: propagation.updates, environmentStep: ENVIRONMENT_STEP };
+    sensitivity: sens, environmentFrames: propagation.updates, environmentStep: ENVIRONMENT_STEP,
+    ...(diagnostics && { diagnostics }) };
 }
-export function evaluate(input) {
+export function evaluate(input, target = 'both', diagnose = false) {
   const config = normalize(input), scene = makeScene(config);
-  return { config, scene, lora: simulate(config, 'lora', scene), ble: simulate(config, 'ble', scene) };
+  const result = { config, scene };
+  if (target !== 'ble') result.lora = simulate(config, 'lora', scene, diagnose);
+  if (target !== 'lora') result.ble = simulate(config, 'ble', scene, diagnose);
+  return result;
 }
+
+const unrelatedRadioParameters = {
+  lora: new Set(['relays', 'ttl', 'repeats', 'scan', 'bleSensitivity']),
+  ble: new Set(['sf', 'bw', 'cr', 'channels', 'mac', 'jitter', 'channelSpacing', 'adjacent'])
+};
+export function radioUsesParameter(kind, key) {
+  return !unrelatedRadioParameters[kind]?.has(key);
+}
+
+const sceneParameters = ['boats', 'spacing', 'layout', 'legLength', 'leewardOffset', 'collectors', 'relays', 'seed'];
+const propagationParameters = ['speed', 'waveHeight', 'wavePeriod', 'power', 'boatHeight', 'boatHeightSpread',
+  'receiverHeight', 'fade', 'loss', 'antennaShadow', 'shadowSide'];
+
+function cachedValue(cache, key, limit, calculate) {
+  if (cache.has(key)) return cache.get(key);
+  const value = calculate();
+  if (cache.size === limit) cache.delete(cache.keys().next().value);
+  cache.set(key, value);
+  return value;
+}
+
+export function createFastEvaluator(target) {
+  const radios = target === 'both' ? ['lora', 'ble'] : [target];
+  const scenes = new Map();
+  const caches = radios.map(kind => ({ kind, reports: new Map(), environments: new Map() }));
+  return config => {
+    const result = { config };
+    const fields = Object.entries(config);
+    for (const { kind, reports, environments } of caches) {
+      const key = JSON.stringify(fields.filter(([parameter]) => radioUsesParameter(kind, parameter)));
+      result[kind] = cachedValue(reports, key, 256, () => {
+        const sceneKey = JSON.stringify(sceneParameters.map(parameter => config[parameter]));
+        const environmentKey = JSON.stringify([sceneKey, ...propagationParameters.map(parameter => config[parameter])]);
+        const scene = cachedValue(scenes, sceneKey, 32, () => makeScene(config));
+        const propagation = cachedValue(environments, environmentKey, 8, () => createPropagation(config, scene, kind));
+        const { capped, pdr, fleet, missingTimely, longestTimelyGap, latency95, diagnostics } =
+          simulate(config, kind, scene, true, propagation);
+        return { capped, pdr, fleet, missingTimely, longestTimelyGap, latency95, diagnostics };
+      });
+    }
+    return result;
+  };
+}
+
 export function objective(result, target = 'both') {
   if (target === 'both' ? result.lora.capped || result.ble.capped : result[target].capped) return null;
   return target === 'both' ? Math.min(result.lora.pdr, result.ble.pdr) : result[target].pdr;
@@ -440,7 +600,13 @@ export function rankResult(result, target = 'both') {
   if (pdr === null) return null;
   const reports = target === 'both' ? [result.ble, result.lora] : [result[target]];
   const latency = reports.map(report => report.latency95);
+  const fleetRatio = report => report.fleet?.rounds.length ? report.fleet.complete / report.fleet.rounds.length : 0;
+  const fleetFloor = report => report.fleet?.target && report.fleet.rounds.length
+    ? Math.min(...report.fleet.rounds.map(round => round.received)) / report.fleet.target : 0;
+  const fleetComplete = Math.min(...reports.map(fleetRatio));
   return {
+    feasible: fleetComplete === 1, fleetComplete,
+    fleetFloor: Math.min(...reports.map(fleetFloor)),
     missing: Math.max(...reports.map(report => report.missingTimely)),
     gap: Math.max(...reports.map(report => report.longestTimelyGap)),
     pdr,
@@ -448,10 +614,11 @@ export function rankResult(result, target = 'both') {
   };
 }
 
-// Negative means a is better. Priorities are strict and apply to both extrema.
+// Negative means a is better. Use fleet coverage before comparing packet metrics.
 export function compareRanks(a, b) {
   const p95a = a.latency95 ?? Infinity, p95b = b.latency95 ?? Infinity;
-  const order = [a.missing - b.missing, a.gap - b.gap, b.pdr - a.pdr, p95a - p95b];
+  const order = [(b.fleetComplete ?? 0) - (a.fleetComplete ?? 0), (b.fleetFloor ?? 0) - (a.fleetFloor ?? 0),
+    a.missing - b.missing, a.gap - b.gap, b.pdr - a.pdr, p95a - p95b];
   return order.find(delta => Math.abs(delta) > 1e-9) ?? 0;
 }
 export function parameterValues(key, limit) {
@@ -478,14 +645,14 @@ export function normalizeSearchLimits(input) {
   return limits;
 }
 export class Explorer {
-  constructor(base, keys, target = 'both', mode = 'both', strategy = 'hybrid', limits = {}) {
-    this.base = normalize(base); this.target = target; this.mode = mode;
+  constructor(base, keys, target = 'both', mode = 'best', strategy = 'hybrid', limits = {}) {
+    this.base = normalize(base); this.target = target; this.mode = mode === 'repeat' ? 'repeat' : 'best';
     const normalized = normalizeSearchLimits(limits);
     this.values = new Map();
     for (const key of new Set(keys)) {
       const values = parameterValues(key, normalized[key]);
       if (!values.length) continue;
-      if (mode !== 'repeat' && !values.includes(this.base[key])) {
+      if (this.mode !== 'repeat' && !values.includes(this.base[key])) {
         const previous = this.base[key];
         this.base[key] = typeof values[0] === 'number'
           ? values.reduce((nearest, value) => Math.abs(previous - value) < Math.abs(previous - nearest) ? value : nearest)
@@ -495,8 +662,8 @@ export class Explorer {
     }
     this.keys = [...this.values.keys()];
     this.strategy = ['hybrid', 'sequential', 'local', 'random'].includes(strategy) ? strategy : 'hybrid';
-    this.r = rng(this.base.seed ^ 0xB937); this.best = null; this.worst = null; this.baseline = null;
-    this.iteration = 0; this.since = 0; this.sweepIndex = 0; this.localIndex = 0; this.pending = null;
+    this.r = rng(this.base.seed ^ 0xB937); this.best = null; this.baseline = null; this.closest = null;
+    this.iteration = 0; this.passed = 0; this.since = 0; this.sweepIndex = 0; this.pending = null;
     this.sweep = this.keys.flatMap(key => this.values.get(key).filter(value => value !== this.base[key]).map(value => ({ key, value })));
   }
   get done() { return this.iteration > 0 && this.mode !== 'repeat' && (!this.keys.length || this.strategy === 'sequential' && this.sweepIndex >= this.sweep.length); }
@@ -517,8 +684,7 @@ export class Explorer {
       // Every one-factor comparison starts from the ORIGINAL baseline, not the previous candidate.
       return proposal({ ...this.base, [key]: value }, 'sweep', 'sweep', this.baseline);
     }
-    const goal = this.mode === 'both' ? (this.localIndex % 2 ? 'worst' : 'best') : this.mode;
-    const incumbent = this[goal] || this.baseline, config = { ...(incumbent?.config || this.base) };
+    const incumbent = this.best || this.closest || this.baseline, config = { ...(incumbent?.config || this.base) };
     const restart = this.strategy === 'random' || this.r() < 0.22;
     const shuffled = [...this.keys];
     for (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(this.r() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }
@@ -535,27 +701,25 @@ export class Explorer {
     }
     // Same geometry, motion and wave realization for every protocol candidate.
     config.seed = this.base.seed;
-    return proposal(config, goal, this.strategy === 'random' ? 'random' : restart ? 'restart' : 'local', incumbent);
+    return proposal(config, 'best', this.strategy === 'random' ? 'random' : restart ? 'restart' : 'local', incumbent);
   }
   accept(result) {
     const rank = rankResult(result, this.target), score = rank?.pdr ?? null, proposal = this.pending;
     let improved = false; this.iteration++;
+    if (rank?.feasible) this.passed++;
     const record = { ...result, rank, score, iteration: this.iteration };
     if (this.iteration === 1) this.baseline = record;
-    let decision = score === null ? 'excluded' : proposal?.phase === 'sweep' ? 'compared' : proposal?.goal === 'repeat' ? 'sampled' : 'baseline';
-    if (rank && ['best', 'worst'].includes(proposal?.goal)) {
+    let decision = score === null ? 'excluded' : !rank.feasible ? 'out' : proposal?.phase === 'sweep' ? 'compared' : proposal?.goal === 'repeat' ? 'sampled' : 'baseline';
+    if (rank?.feasible && proposal?.goal === 'best') {
       const delta = proposal.parentRank ? compareRanks(rank, proposal.parentRank) : 0;
-      const better = !proposal.parentRank || (proposal.goal === 'best' ? delta < 0 : delta > 0);
+      const better = !proposal.parentRank?.feasible || delta < 0;
       decision = better ? 'accepted' : 'retained';
     }
-    if (rank) {
-      if (!this.best || compareRanks(rank, this.best.rank) < 0) { this.best = record; improved = true; }
-      if (!this.worst || compareRanks(rank, this.worst.rank) > 0) { this.worst = record; improved = true; }
-    }
+    if (rank && (!this.closest || compareRanks(rank, this.closest.rank) < 0)) this.closest = record;
+    if (rank?.feasible && (!this.best || compareRanks(rank, this.best.rank) < 0)) { this.best = record; improved = true; }
     if (proposal?.phase === 'sweep') this.sweepIndex++;
-    else if (['best', 'worst'].includes(proposal?.goal)) this.localIndex++;
     this.since = improved ? 0 : this.since + 1; this.pending = null;
     return { rank, score, improved, iteration: this.iteration, decision,
-      retainedIteration: ['best', 'worst'].includes(proposal?.goal) ? this[proposal.goal]?.iteration : null };
+      retainedIteration: proposal?.goal === 'best' ? this.best?.iteration : null };
   }
 }

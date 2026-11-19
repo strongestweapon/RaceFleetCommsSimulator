@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RaceFleetCommsSimulator",
+  "version": "../package.json",
+  "identifier": "com.strongestweapon.racefleetcomms",
+  "build": {
+    "frontendDist": [
+      "../index.html",
+      "../style.css",
+      "../app.js",
+      "../engine.js",
+      "../ilca-course.js",
+      "../worker.js",
+      "../lora-100-best-snapshot.json"
+    ]
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "경기정 통신 시뮬레이터",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/app.png", "icons/app.icns"],
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}
